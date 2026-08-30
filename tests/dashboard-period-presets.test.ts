@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { buildPresets, ymd } from "@/features/dashboard/components/period-presets";
+// Hotfix 8.1.3 §1 — the preset ARITHMETIC moved out of the `"use client"`
+// component file into the plain `@/features/dashboard/period-presets` module
+// so the Dashboard SERVER page can share it (see that file's header). The
+// component still renders exactly these presets; only the import path here
+// changed.
+import { buildPresets, ymd } from "@/features/dashboard/period-presets";
 
 // Phase 8 Patch 8.1 §43-46 — Dashboard period presets. `buildPresets`
 // accepts a pinned `now` (a Date whose LOCAL getters already read as Riyadh
@@ -10,7 +15,7 @@ import { buildPresets, ymd } from "@/features/dashboard/components/period-preset
 // rather than a degenerate same-day case.
 const WED_SEP_2_2026 = new Date(2026, 8, 2);
 
-describe("features/dashboard/components/period-presets.tsx — buildPresets", () => {
+describe("features/dashboard/period-presets.ts — buildPresets", () => {
   it("computes every preset's from/to relative to a pinned Wednesday, matching the Riyadh Week Contract (Saturday start) for 'this week'", () => {
     const presets = buildPresets(WED_SEP_2_2026);
     const byKey = Object.fromEntries(presets.map((p) => [p.key, p]));
@@ -51,7 +56,7 @@ describe("features/dashboard/components/period-presets.tsx — buildPresets", ()
   });
 });
 
-describe("features/dashboard/components/period-presets.tsx — ymd", () => {
+describe("features/dashboard/period-presets.ts — ymd", () => {
   it("zero-pads single-digit month/day", () => {
     expect(ymd(new Date(2026, 0, 5))).toBe("2026-01-05");
   });

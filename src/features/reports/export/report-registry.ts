@@ -458,7 +458,15 @@ export const TABLE_REPORTS: Record<string, TableReportDefinition> = {
     // returns.view alone, who the RPC itself was already designed to let
     // see the Refund Cash section. Fixed to the RPC's own actual base gate.
     domainPermission: "reports.view",
-    extraFilterKeys: ["refund_method_id", "collection_channel_id"],
+    // Hotfix 8.1.3 §B2 — `payment_method_id` (the SALE's own / the
+    // settlement route's own payment method, 0225's `p_payment_method_id`,
+    // distinct from the Actual Refund Cash section's `refund_method_id`) is
+    // offered by the screen's own filter bar and forwarded verbatim by the
+    // export buttons, but was missing here — so the export silently dropped
+    // it and produced a DIFFERENT dataset from the screen it was exported
+    // from (§39/§44 export/screen parity). Every key listed here is what
+    // route.ts copies out of the query string into the RPC filters.
+    extraFilterKeys: ["payment_method_id", "refund_method_id", "collection_channel_id"],
     fetch: (f) => getPaymentMethodsReport(f),
   },
   "collection-channels": {

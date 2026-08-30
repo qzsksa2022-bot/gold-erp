@@ -74,6 +74,17 @@ export function ReportFilterBar({
   showDateRange = true,
   /** Single-date mode for the Daily/Weekly Management Reports — renders ONE date input bound to `date_from` instead of a from/to pair. */
   singleDate = false,
+  /**
+   * Hotfix 8.1.3 §3 — URL keys to CLEAR (never just leave behind) whenever
+   * the PRIMARY date range is edited by hand. Built for the Dashboard's
+   * `period_preset` (0221's `p_period_preset`): once the user types their
+   * own `date_from`/`date_to`, the preset key written by the last
+   * quick-period button no longer describes the range being requested, and a
+   * stale key would make `report_calendar_comparison_period()` compare
+   * against the wrong calendar unit entirely. Empty by default — every other
+   * report page has nothing that a date edit invalidates.
+   */
+  dateChangeClearKeys = [],
   searchPlaceholder = "بحث...",
 }: {
   search?: string;
@@ -87,6 +98,7 @@ export function ReportFilterBar({
   showSearch?: boolean;
   showDateRange?: boolean;
   singleDate?: boolean;
+  dateChangeClearKeys?: string[];
   searchPlaceholder?: string;
 }) {
   const router = useRouter();
@@ -104,6 +116,17 @@ export function ReportFilterBar({
     }
     params.set("page", "1");
     startTransition(() => router.push(`${pathname}?${params.toString()}`));
+  }
+
+  /**
+   * Hotfix 8.1.3 §3 — a primary-date edit commits its own key PLUS an empty
+   * value for every `dateChangeClearKeys` entry; `updateParams` already
+   * deletes (rather than writes) an empty value, so the stale key leaves the
+   * URL entirely instead of lingering as `period_preset=`.
+   */
+  function withDateChangeClears(next: Record<string, string>): Record<string, string> {
+    for (const key of dateChangeClearKeys) next[key] = "";
+    return next;
   }
 
   return (
@@ -125,12 +148,12 @@ export function ReportFilterBar({
 
       {showDateRange && !singleDate && (
         <>
-          <Input type="date" dir="ltr" value={dateFrom ?? ""} onChange={(e) => updateParams({ date_from: e.target.value })} />
-          <Input type="date" dir="ltr" value={dateTo ?? ""} onChange={(e) => updateParams({ date_to: e.target.value })} />
+          <Input type="date" dir="ltr" value={dateFrom ?? ""} onChange={(e) => updateParams(withDateChangeClears({ date_from: e.target.value }))} />
+          <Input type="date" dir="ltr" value={dateTo ?? ""} onChange={(e) => updateParams(withDateChangeClears({ date_to: e.target.value }))} />
         </>
       )}
 
-      {singleDate && <Input type="date" dir="ltr" value={dateFrom ?? ""} onChange={(e) => updateParams({ date_from: e.target.value })} />}
+      {singleDate && <Input type="date" dir="ltr" value={dateFrom ?? ""} onChange={(e) => updateParams(withDateChangeClears({ date_from: e.target.value }))} />}
 
       {stores && (
         <Select value={storeId || "all"} onValueChange={(v) => updateParams({ store_id: v === "all" ? "" : v })}>

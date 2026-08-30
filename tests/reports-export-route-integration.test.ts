@@ -445,6 +445,114 @@ describe("GET /api/reports/export — real route handler integration", () => {
     expect(workbook.worksheets.map((w) => w.name)).toEqual(["Summary", "Data"]);
   });
 
+  /**
+   * Hotfix 8.1.3 Blocker 2 — Payment Methods export parity. The screen page
+   * has offered a `payment_method_id` filter ("طريقة الدفع الأصلية", the
+   * SALE's own / the settlement route's own payment method, 0225's
+   * `p_payment_method_id` — distinct from the Actual Refund Cash section's
+   * `refund_method_id`) since Hotfix 8.1.2 §31-33, and `ReportExportButtons`
+   * forwards `location.search` verbatim, so the key always ARRIVED at the
+   * export route. But `payment-methods.extraFilterKeys` did not list it, and
+   * route.ts only copies the keys that registry entry names — so the export
+   * silently dropped the filter and produced a WIDER dataset than the screen
+   * it was exported from (§39/§44 screen/export parity).
+   *
+   * This asserts on the arguments of the REAL `get_payment_methods_report`
+   * call the real route made through the real registry `fetch()` wrapper —
+   * not on the registry array's contents, which would restate the fix rather
+   * than prove it reaches the RPC.
+   */
+  it("Hotfix 8.1.3 B2 CRITICAL: payment_method_id from the export query string actually reaches get_payment_methods_report as p_payment_method_id", async () => {
+    requirePermission.mockResolvedValue(sessionWith(new Set(["reports.view", "reports.export_excel", "reports.export_pdf", "sales.view_profit"])));
+    rpcMock.mockImplementation(
+      rpcRouter({
+        report_visible_stores_lookup: [],
+        // An active non-skipped filter key makes resolveFilterLabels()
+        // (§20-22) fan out to all nine lookups regardless of report slug.
+        report_categories_lookup: [],
+        report_karats_lookup: [],
+        report_payment_methods_lookup: [{ id: "pm-1", name_ar: "مدى" }],
+        report_collection_channels_lookup: [],
+        report_shipping_carriers_lookup: [],
+        report_shipping_zones_lookup: [],
+        report_adjustment_types_lookup: [],
+        report_settlement_routes_lookup: [],
+        report_employees_lookup: [],
+        get_payment_methods_report: {
+          total_count: 1,
+          limit: 5000,
+          offset: 0,
+          summary: { payment_method_pairs_count: 1, orders_count: 1, revenue: "1000.00", net_sales_profit: "150.00" },
+          rows: [{ payment_method_id: "pm-1", payment_method_name: "مدى", collection_channel_name: null, orders_count: 1, revenue: "1000.00", payment_fees: "10.00", net_sales_profit: "150.00" }],
+        },
+      }),
+    );
+
+    const req = new NextRequest(
+      exportUrl({
+        report: "payment-methods",
+        format: "excel",
+        date_from: "2026-07-01",
+        date_to: "2026-07-31",
+        payment_method_id: "pm-1",
+        // The two filter keys that ALREADY worked, asserted alongside so a
+        // future regression that swaps one for the other is caught too.
+        refund_method_id: "pm-2",
+        collection_channel_id: "cc-1",
+      }),
+    );
+    const res = await GET(req);
+
+    expect(res.status).toBe(200);
+    const reportCall = rpcMock.mock.calls.find((c) => c[0] === "get_payment_methods_report");
+    expect(reportCall).toBeDefined();
+    expect(reportCall![1]).toMatchObject({
+      p_date_from: "2026-07-01",
+      p_date_to: "2026-07-31",
+      p_payment_method_id: "pm-1",
+      p_refund_method_id: "pm-2",
+      p_collection_channel_id: "cc-1",
+    });
+  });
+
+  it("Hotfix 8.1.3 B2: an ABSENT payment_method_id still reaches the RPC as an explicit null (never the string \"undefined\"), so the unfiltered export stays unfiltered", async () => {
+    requirePermission.mockResolvedValue(sessionWith(new Set(["reports.view", "reports.export_excel", "reports.export_pdf", "sales.view_profit"])));
+    rpcMock.mockImplementation(
+      rpcRouter({
+        report_visible_stores_lookup: [],
+        get_payment_methods_report: {
+          total_count: 0,
+          limit: 5000,
+          offset: 0,
+          summary: { payment_method_pairs_count: 0, orders_count: 0, revenue: "0.00", net_sales_profit: "0.00" },
+          rows: [],
+        },
+      }),
+    );
+
+    const req = new NextRequest(exportUrl({ report: "payment-methods", format: "excel", date_from: "2026-07-01", date_to: "2026-07-31" }));
+    const res = await GET(req);
+
+    expect(res.status).toBe(200);
+    const reportCall = rpcMock.mock.calls.find((c) => c[0] === "get_payment_methods_report");
+    expect(reportCall![1]).toMatchObject({ p_payment_method_id: null });
+  });
+
+  /**
+   * Hotfix 8.1.3 B2 — the parity claim itself, stated as an invariant over
+   * the registry rather than one report: every filter key the Payment
+   * Methods SCREEN can put in the URL must be a key the export forwards.
+   * This is what actually failed before the fix, and what would fail again
+   * the next time a filter is added to the page but not to the registry.
+   */
+  it("Hotfix 8.1.3 B2: payment-methods' export filter keys cover every filter the screen page offers", async () => {
+    const { TABLE_REPORTS } = await import("@/features/reports/export/report-registry");
+    // The three `selects` rendered by src/app/(app)/reports/payment-methods/page.tsx.
+    for (const screenFilterKey of ["payment_method_id", "refund_method_id", "collection_channel_id"]) {
+      expect(TABLE_REPORTS["payment-methods"].extraFilterKeys).toContain(screenFilterKey);
+    }
+  });
+
   it("§2/§36: Returns report under basis=actual_cash resolves the actual_cash columns (refund_method_name/cash_effect), never the business_effect shape, through the real pipeline", async () => {
     requirePermission.mockResolvedValue(sessionWith(new Set(["reports.view", "returns.view", "reports.export_excel", "reports.export_pdf"])));
     rpcMock.mockImplementation(

@@ -1,6 +1,6 @@
 import { AlertTriangle } from "lucide-react";
 import { requirePermission } from "@/lib/permissions/guard";
-import { getDashboardStats, getDashboardSummary, getDashboardTrends } from "@/features/dashboard/queries";
+import { getDashboardStats, getDashboardSummaryWithComparison, getDashboardTrends } from "@/features/dashboard/queries";
 import { getReportVisibleStores } from "@/features/reports/queries";
 import { PageHeader } from "@/components/shared/page-header";
 import { StatCard } from "@/features/dashboard/components/stat-card";
@@ -11,9 +11,17 @@ import { KpiSection } from "@/features/dashboard/components/kpi-section";
 import { NetOperatingReturnCard } from "@/features/dashboard/components/net-operating-return-card";
 import { TrendChart, type TrendValueFormat } from "@/features/dashboard/components/trend-chart";
 import { PeriodPresets } from "@/features/dashboard/components/period-presets";
+import { resolveDashboardPeriodPreset } from "@/features/dashboard/period-presets";
 import { riyadhTodayIsoDate } from "@/lib/date";
 import { Users, Store, CheckCircle2 } from "lucide-react";
 
+/**
+ * Hotfix 8.1.3 §4 — the Dashboard's default range. Month start → today is
+ * byte-for-byte `buildPresets()`'s own `this_month` from/to, which is
+ * exactly what makes `resolveDashboardPeriodPreset()` resolve the
+ * no-query-params case to `this_month` (and therefore compare against the
+ * FULL previous calendar month) rather than to `custom`.
+ */
 function currentMonthStart(): string {
   const today = riyadhTodayIsoDate();
   return `${today.slice(0, 7)}-01`;
@@ -47,10 +55,18 @@ export default async function DashboardPage({ searchParams }: { searchParams: Pr
   const dateFrom = str("date_from") || currentMonthStart();
   const dateTo = str("date_to") || riyadhTodayIsoDate();
   const storeId = str("store_id") || undefined;
+  // Hotfix 8.1.3 §2-4 — never the raw `period_preset` query param: a known
+  // preset key (written by the quick-period buttons) passes through, an
+  // absent one (a manual date edit CLEARS it, §3) is re-derived from the
+  // range itself, and an unknown/hand-crafted one is re-derived too.
+  const periodPreset = resolveDashboardPeriodPreset(str("period_preset") || undefined, dateFrom, dateTo);
 
   const [stats, summary, trends, stores] = await Promise.all([
     getDashboardStats(),
-    getDashboardSummary(dateFrom, dateTo, storeId ? [storeId] : undefined),
+    // Hotfix 8.1.3 §1 — the CALENDAR-AWARE wrapper (0221), not the bare
+    // get_dashboard_summary(): "This Month" must compare against the full
+    // previous calendar month, not the preceding equal-length window.
+    getDashboardSummaryWithComparison(dateFrom, dateTo, periodPreset, storeId ? [storeId] : undefined),
     getDashboardTrends(dateFrom, dateTo, storeId ? [storeId] : undefined),
     getReportVisibleStores(),
   ]);
@@ -68,8 +84,11 @@ export default async function DashboardPage({ searchParams }: { searchParams: Pr
     <div>
       <PageHeader title="الرئيسية" description="الملخص التنفيذي — نظرة شاملة على الأداء المالي والتشغيلي للفترة المحددة." />
 
-      <PeriodPresets dateFrom={dateFrom} dateTo={dateTo} />
-      <ReportFilterBar dateFrom={dateFrom} dateTo={dateTo} storeId={storeId} stores={stores} showSearch={false} />
+      <PeriodPresets dateFrom={dateFrom} dateTo={dateTo} periodPreset={periodPreset} />
+      {/* Hotfix 8.1.3 §3 — editing a date by hand must not leave the
+          previously-clicked preset behind in the URL: it would keep claiming
+          a calendar unit the range no longer covers. */}
+      <ReportFilterBar dateFrom={dateFrom} dateTo={dateTo} storeId={storeId} stores={stores} showSearch={false} dateChangeClearKeys={["period_preset"]} />
 
       {containsOpenDay && (
         <div className="mb-4 flex items-center gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning">

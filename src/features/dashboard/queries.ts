@@ -23,6 +23,39 @@ export async function getDashboardSummary(dateFrom: string, dateTo: string, stor
 }
 
 /**
+ * Hotfix 8.1.2 §1-5 / Hotfix 8.1.3 §1 — the CALENDAR-AWARE Dashboard
+ * summary. `get_dashboard_summary_with_comparison()` (migration 0221) calls
+ * the canonical `get_dashboard_summary()` above exactly twice inside ONE
+ * MVCC snapshot — for the caller's own range, and for the previous range
+ * `report_calendar_comparison_period(p_period_preset, ...)` resolves — so a
+ * `this_week`/`this_month`/`this_year` view compares against the FULL
+ * previous Riyadh week / calendar month / calendar year rather than the
+ * generic "immediately preceding equal-length range" `get_dashboard_summary()`
+ * alone can offer.
+ *
+ * Returns the same jsonb shape as `getDashboardSummary()` (identical domain
+ * sub-objects, identical §79 true key-absence — the wrapper only ever
+ * rewrites `previous_<field>`/`<field>_change`/`<field>_pct_change` keys
+ * that were ALREADY present) plus the `date_from`/`date_to`/`period_preset`/
+ * `previous_date_from`/`previous_date_to`/`comparison_mode` envelope keys.
+ *
+ * `periodPreset` is resolved by `resolveDashboardPeriodPreset()`
+ * (@/features/dashboard/period-presets) from the URL, never read raw — see
+ * that function for the §2-4 rules.
+ */
+export async function getDashboardSummaryWithComparison(dateFrom: string, dateTo: string, periodPreset?: string, storeIds?: string[]) {
+  const supabase = await createClient();
+  const { data, error } = await supabase.rpc("get_dashboard_summary_with_comparison", {
+    p_date_from: dateFrom,
+    p_date_to: dateTo,
+    p_period_preset: periodPreset ?? null,
+    p_store_ids: storeIds ?? null,
+  });
+  if (error) throw error;
+  return data as unknown as Record<string, unknown>;
+}
+
+/**
  * Phase 8 §19/§73 — Trend charts. get_dashboard_trends() (migration 0200)
  * returns `{ granularity, date_from, date_to, buckets: [...] }`, every
  * bucket zero-filled (no missing chart points) at the auto-derived

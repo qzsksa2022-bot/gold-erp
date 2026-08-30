@@ -1,0 +1,196 @@
+@import "tailwindcss";
+/* NOT wrapped in `layer(utilities)`: this package emits its own top-level
+   `@utility` at-rules (Tailwind v4's custom-utility syntax), and `@utility`
+   is not allowed to be nested inside a `@layer` block — Tailwind's compiler
+   requires it at the stylesheet root. Importing it plainly still lets
+   Tailwind's cascade layers place the generated utilities correctly. */
+@import "tw-animate-css";
+
+/* ==========================================================================
+   Design Tokens — Centralized Theme
+   --------------------------------------------------------------------------
+   Every color / radius / shadow / spacing primitive used across the product
+   is declared ONCE here as a CSS variable. Components must reference the
+   Tailwind utility classes generated from these tokens (bg-background,
+   text-foreground, bg-accent, rounded-md, shadow-soft ...) and must never
+   hardcode a raw hex value inline. This is what lets "اسم النظام / الشعار /
+   الخط / لون Accent" be changed later from Settings without touching
+   dozens of files: the Settings module (src/features/settings) writes the
+   *runtime-overridable* subset (currently: accent color + font) as inline
+   CSS variables on <html> at request time — see src/lib/theme/runtime.ts.
+   ========================================================================== */
+
+@theme inline {
+  --font-sans: var(--font-app-sans);
+  --font-mono: var(--font-app-mono);
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 6px);
+
+  --shadow-soft: var(--shadow-soft-value);
+  --shadow-elevated: var(--shadow-elevated-value);
+}
+
+:root {
+  /* Base scale */
+  --radius: 0.625rem;
+
+  /* Fonts — Arabic-first system stack (no external network fetch required).
+     Overridable at runtime from Settings → Appearance. */
+  --font-app-sans: "IBM Plex Sans Arabic", "Tajawal", "Segoe UI", "Cairo",
+    system-ui, -apple-system, "Noto Sans Arabic", sans-serif;
+  --font-app-mono: ui-monospace, "SFMono-Regular", Menlo, monospace;
+
+  /* Luxury light palette: warm ivory surfaces, near-black ink, muted antique
+     gold accent used sparingly for interactive/highlight moments only. */
+  --background: #faf8f4;
+  --foreground: #1c1a17;
+
+  --card: #ffffff;
+  --card-foreground: #1c1a17;
+
+  --popover: #ffffff;
+  --popover-foreground: #1c1a17;
+
+  --primary: #1f1b16;
+  --primary-foreground: #faf8f4;
+
+  --secondary: #f1ede4;
+  --secondary-foreground: #1f1b16;
+
+  --accent: #a9812e;
+  --accent-foreground: #ffffff;
+
+  --muted: #f1ede4;
+  --muted-foreground: #6b6459;
+
+  --destructive: #b3261e;
+  --destructive-foreground: #ffffff;
+
+  --success: #2e7d32;
+  --success-foreground: #ffffff;
+
+  --warning: #b7791f;
+  --warning-foreground: #ffffff;
+
+  --border: #e8e2d6;
+  --input: #e8e2d6;
+  --ring: #a9812e;
+
+  --sidebar: #1f1b16;
+  --sidebar-foreground: #ece7dd;
+  --sidebar-border: #322c23;
+  --sidebar-accent: #2c2620;
+  --sidebar-accent-foreground: #e8c874;
+
+  --shadow-soft-value: 0 1px 2px 0 rgb(28 26 23 / 0.04), 0 1px 3px 0 rgb(28 26 23 / 0.06);
+  --shadow-elevated-value: 0 4px 12px -2px rgb(28 26 23 / 0.08), 0 8px 24px -4px rgb(28 26 23 / 0.1);
+}
+
+.dark {
+  --background: #14120f;
+  --foreground: #ece7dd;
+
+  --card: #1c1a17;
+  --card-foreground: #ece7dd;
+
+  --popover: #1c1a17;
+  --popover-foreground: #ece7dd;
+
+  --primary: #ece7dd;
+  --primary-foreground: #1c1a17;
+
+  --secondary: #262019;
+  --secondary-foreground: #ece7dd;
+
+  --accent: #c9a227;
+  --accent-foreground: #1c1a17;
+
+  --muted: #262019;
+  --muted-foreground: #a39a8a;
+
+  --destructive: #e5534b;
+  --destructive-foreground: #ffffff;
+
+  --success: #4caf50;
+  --success-foreground: #0f1f10;
+
+  --warning: #d99a3d;
+  --warning-foreground: #241a05;
+
+  --border: #322c23;
+  --input: #322c23;
+  --ring: #c9a227;
+
+  --sidebar: #0f0d0b;
+  --sidebar-foreground: #ece7dd;
+  --sidebar-border: #262019;
+  --sidebar-accent: #1c1712;
+  --sidebar-accent-foreground: #e8c874;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    color-scheme: light;
+  }
+  html.dark {
+    color-scheme: dark;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "ss01" 1;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+  }
+}
+
+/* Refined, restrained scrollbars — luxury feel, not default-browser chrome. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--muted-foreground) transparent;
+}

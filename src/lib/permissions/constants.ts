@@ -97,6 +97,11 @@ export const PERMISSION_KEYS = [
   "adjustments.process_closed_day",
   "adjustments.manage_types",
 
+  // Phase 9 (Inventory Core, migration 0227)
+  "inventory.view",
+  "inventory.receive",
+  "inventory.adjust",
+
   "audit_logs.view",
 
   "settings.manage",
@@ -118,6 +123,7 @@ export const PERMISSION_CATEGORY_LABELS_AR: Record<string, string> = {
   shipments: "الشحنات",
   shipping_rates: "تسعير الشحن",
   adjustments: "التعديلات والخدمات",
+  inventory: "المخزون",
   audit_logs: "سجل الأحداث",
   system: "النظام",
 };

@@ -35,6 +35,10 @@ export const ROUTES = {
   adjustmentsNew: "/adjustments/new",
   settlements: "/settlements",
   settlementsNew: "/settlements/new",
+  // Phase 9 — Inventory Core.
+  inventory: "/inventory",
+  inventoryItems: "/inventory/items",
+  inventoryMovements: "/inventory/movements",
   reports: "/reports",
   // Phase 8 — Reports, Dashboard & Exports (§21-§37, migrations 0201-0204).
   reportsSales: "/reports/sales",

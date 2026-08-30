@@ -3833,6 +3833,78 @@ export interface Database {
         Args: Record<string, never>;
         Returns: { id: string; full_name: string; status: string }[];
       };
+      // Phase 9 (Inventory Core, migrations 0227-0229).
+      create_inventory_item: {
+        Args: { p_sku: string; p_name_ar: string; p_category_id: string; p_karat_id?: string | null; p_unit?: string; p_notes?: string | null };
+        Returns: { id: string; sku: string; row_version: number }[];
+      };
+      update_inventory_item: {
+        Args: {
+          p_id: string;
+          p_expected_version: number;
+          p_name_ar: string;
+          p_category_id: string;
+          p_karat_id?: string | null;
+          p_unit?: string;
+          p_active?: boolean;
+          p_notes?: string | null;
+        };
+        Returns: { id: string; row_version: number }[];
+      };
+      receive_inventory_stock: {
+        Args: { p_item_id: string; p_store_id: string; p_quantity: string | number; p_business_date?: string; p_reference?: string | null; p_notes?: string | null };
+        Returns: { id: string; resulting_balance: string }[];
+      };
+      adjust_inventory_stock: {
+        Args: { p_item_id: string; p_store_id: string; p_quantity_delta: string | number; p_reason: string; p_business_date?: string; p_reference?: string | null };
+        Returns: { id: string; resulting_balance: string }[];
+      };
+      list_inventory_items: {
+        Args: { p_search?: string | null; p_category_id?: string | null; p_karat_id?: string | null; p_active?: boolean | null; p_limit?: number; p_offset?: number };
+        Returns: {
+          id: string;
+          sku: string;
+          name_ar: string;
+          category_id: string;
+          category_name_ar: string | null;
+          karat_id: string | null;
+          karat_name_ar: string | null;
+          unit: string;
+          active: boolean;
+          notes: string | null;
+          row_version: number;
+          created_at: string;
+          total_count: number;
+        }[];
+      };
+      list_inventory_stock_balances: {
+        Args: { p_store_id?: string | null; p_item_id?: string | null; p_search?: string | null; p_limit?: number; p_offset?: number };
+        Returns: { item_id: string; sku: string; name_ar: string; unit: string; store_id: string; store_name_ar: string; balance: string; total_count: number }[];
+      };
+      list_inventory_stock_movements: {
+        Args: { p_item_id?: string | null; p_store_id?: string | null; p_date_from?: string | null; p_date_to?: string | null; p_limit?: number; p_offset?: number };
+        Returns: {
+          id: string;
+          item_id: string;
+          sku: string;
+          item_name_ar: string;
+          store_id: string;
+          store_name_ar: string;
+          movement_kind: string;
+          quantity_delta: string;
+          business_date: string;
+          reason: string | null;
+          reference: string | null;
+          created_at: string;
+          created_by_name: string | null;
+          total_count: number;
+        }[];
+      };
+      inventory_operable_store_lookups: { Args: Record<string, never>; Returns: { id: string; name_ar: string }[] };
+      inventory_visible_store_lookups: { Args: Record<string, never>; Returns: { id: string; name_ar: string }[] };
+      inventory_active_item_lookups: { Args: Record<string, never>; Returns: { id: string; sku: string; name_ar: string }[] };
+      inventory_category_lookups: { Args: Record<string, never>; Returns: { id: string; name_ar: string }[] };
+      inventory_karat_lookups: { Args: Record<string, never>; Returns: { id: string; name_ar: string }[] };
     };
     Enums: Record<string, never>;
   };

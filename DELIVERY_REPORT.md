@@ -3072,4 +3072,64 @@ Hotfix 6.1.2 **لا تضيف ولا تُعدِّل** أي صلاحية `adjustme
 
 ---
 
+## الملحق الثامن والثلاثون — "Phase 9: نواة المخزون (Inventory Core)" (ترحيلات 0227–0229)
+
+بعد موافقة صريحة من المستخدم (بعد تقييم مقارن بين "نواة المخزون" و"دفتر مصروفات الفروع" استنادًا إلى ترتيب الاعتماد المعماري)، تم تنفيذ **Phase 9 = نواة المخزون فقط**: كتالوج أصناف (SKU) عام + دفتر حركات مخزون إضافي-فقط ومُقيَّد بالفرع، عمليات يدوية فقط (استلام/تصحيح/عرض أرصدة وسجل)، بلا أي ربط تلقائي بالمبيعات/المرتجعات، وبلا أي وحدة أخرى من الوحدات المؤجَّلة (Salla/Carrier/Bank API، GL/COGS، Attachments، Backups، 2FA، مزامنة، Forecasting/AI، CRM، Payroll، Purchasing، مصروفات الفروع).
+
+### 1) الترحيلات الجديدة (0227–0229)
+
+| # | الترحيلة | تُضيف |
+|---|---|---|
+| 0227 | `inventory_permissions_and_locks.sql` | ثلاث صلاحيات جديدة (`inventory.view`/`inventory.receive`/`inventory.adjust`) — منح `super_admin`/`admin`/`supervisor` للثلاث، `accountant` لـ`inventory.view` فقط، بلا أي منح افتراضي لأدوار الموظفين التشغيليين (يُمنح لاحقًا عبر واجهة الصلاحيات دون أي تعديل كود). قفل استشاري جديد `acquire_inventory_item_store_lock(item_id, store_id)` (`key1=1008`، مفتاح ثانٍ = `hashtext(item_id || ':' || store_id)`) — يحل محل قفل الصف التقليدي إذ لا يوجد عمود رصيد مخزَّن يمكن قفله. |
+| 0228 | `inventory_core_schema.sql` | جدول `inventory_items` (كتالوج عام غير مقيَّد بالفرع، `sku` فريد case-insensitive وغير قابل للتعديل بعد الإنشاء، `row_version` للتزامن التفاؤلي، RLS من الطبقة-A مع سياسة SELECT واحدة فقط مقيَّدة بـ`inventory.view`)؛ جدول `inventory_stock_movements` (دفتر إضافي-فقط مُقيَّد بالفرع، `quantity_delta numeric(12,3)` موقَّع، بلا أي عمود رصيد مخزَّن — الرصيد دائمًا `SUM()` مُشتقّ حيًّا من الدفتر، يطابق فلسفة `settlement_bank_movement_events` حرفيًا؛ triggers ترفض أي UPDATE/DELETE مباشر). |
+| 0229 | `inventory_core_rpcs.sql` | `create_inventory_item()`/`update_inventory_item()` (تزامن تفاؤلي بـ`row_version`)؛ `record_inventory_stock_movement()` (محرك داخلي مشترك يأخذ القفل الاستشاري **قبل** جمع الدفتر ثم يرفض أي حركة قد تجعل الرصيد سالبًا)؛ `receive_inventory_stock()`/`adjust_inventory_stock()` (يستدعيان المحرك بصلاحية ونوع حركة مُثبَّتين، فلا يستطيع العميل خلط `receive` بصلاحية `inventory.adjust` أو العكس)؛ `list_inventory_items()`/`list_inventory_stock_balances()`/`list_inventory_stock_movements()` (قراءة مُقسَّمة صفحيًا، مقيَّدة دومًا بـ`user_visible_store_ids()`)؛ دوال بحث ضيقة (`inventory_operable_store_lookups`/`inventory_visible_store_lookups`/`inventory_active_item_lookups`/`inventory_category_lookups`/`inventory_karat_lookups`) كل منها مقيَّد بالصلاحية الدقيقة التي تحتاجها فقط، بلا اعتماد على `stores.view`/`categories.view`/`karats.view`. |
+
+### 2) الجداول الجديدة (2) ونموذج الوصول
+
+**نموذج RPC-فقط (صفر سياسات كتابة RLS مباشرة):** `inventory_items` (كتالوج عام، غير مقيَّد بالفرع)، `inventory_stock_movements` (دفتر إضافي-فقط مُقيَّد بالفرع، محمي إضافيًا بـ`reject_inventory_stock_movement_mutation()` عند أي UPDATE/DELETE مباشر حتى لو تجاوز أحدهم RLS). الرصيد لأي زوج (صنف، فرع) **ليس عمودًا مخزَّنًا في أي مكان** — يُحسب دائمًا حيًّا كمجموع `quantity_delta`، ما يزيل مشكلة تعارض التحديث المتزامن على عمود رصيد من جذورها (القفل الاستشاري الجديد `key1=1008` هو الضامن الحقيقي بدل ذلك).
+
+### 3) الصفحات والمكوّنات الجديدة
+
+`/inventory` (أرصدة المخزون الحالية لكل صنف/فرع مع فلاتر، وأزرار استلام/تصحيح)، `/inventory/items` (كتالوج الأصناف — إضافة/تعديل)، `/inventory/movements` (سجل الحركات للقراءة فقط مع فلاتر صنف/فرع/تاريخ). مكوّنات: `inventory-item-form-dialog.tsx`، `inventory-receive-stock-dialog.tsx`، `inventory-adjust-stock-dialog.tsx`، `inventory-balances-filters.tsx`، `inventory-movements-filters.tsx`. طبقة الخلفية: `src/features/inventory/{schema,queries,actions}.ts`. عنصر تنقل جديد ("المخزون") في الشريط الجانبي، مقيَّد بـ`inventory.view`.
+
+### 4) الصلاحيات (3 إجمالًا، جديدة بالكامل في هذه المرحلة)
+
+`inventory.view` (عرض الكتالوج/الأرصدة/السجل)، `inventory.receive` (إنشاء صنف جديد + تسجيل استلام)، `inventory.adjust` (تعديل بيانات صنف + تسجيل تصحيح يدوي بسبب إلزامي). إنشاء الصنف عُمدًا مقيَّد بـ`inventory.receive` لا صلاحية "إدارة كتالوج" مستقلة — النطاق المعتمد يحدد ثلاث صلاحيات فقط.
+
+### 5) قرارات تصميم أساسية
+
+1. **الرصيد لا يُخزَّن أبدًا، يُشتق حيًّا من الدفتر:** يطابق نمط `settlement_bank_movement_events`/`reconcile_settlement_batch()` (Phase 7) حرفيًا، ما يزيل فئة كاملة من أخطاء التزامن (لا عمود رصيد يمكن أن ينحرف عن مصدره).
+2. **القفل الاستشاري بدل قفل الصف:** لا يوجد صف رصيد فعلي لقفله، فيُستخدَم `pg_advisory_xact_lock(1008, hashtext(item_id || ':' || store_id))` قبل جمع الدفتر مباشرة — يطابق نمط `acquire_returns_order_lock()` (`key1=1004`) في الشكل، مع اختلاف أن المفتاح الثاني يُشتق من زوج (صنف، فرع) لا معرِّف واحد.
+3. **الحارس الحقيقي لمنع الرصيد السالب داخل RPC واحد مشترك:** `receive_inventory_stock()`/`adjust_inventory_stock()` كلاهما يستدعيان `record_inventory_stock_movement()` الداخلية (غير ممنوحة مباشرة للعميل) بدل تكرار المنطق — يضمن استحالة اختلاف سلوك الحارس بين نوعي الحركة.
+4. **لا ربط تلقائي بالمبيعات/المرتجعات في هذه المرحلة:** كل حركة مخزون يدوية بالكامل (استلام أو تصحيح)، تمامًا كما نصّ النطاق المعتمد — لا تعديل واحد على أي RPC من Sales/Returns.
+5. **الكتالوج عام غير مقيَّد بالفرع، الدفتر مقيَّد بالفرع:** يطابق الشكل الطبيعي لسلسلة مخزون متعددة الفروع (نفس الصنف موجود منطقيًا في كل فرع، برصيد مختلف لكل فرع) بدل تكرار صف الصنف لكل فرع.
+
+### 6) الاختبارات — ما نُفِّذ فعليًا في هذه الجلسة، وما لم يُنفَّذ
+
+**نُفِّذ فعليًا وبنتائج حقيقية في هذه الجلسة (بيئة بلا خادم Postgres محلي متاح):**
+- `npx tsc --noEmit` → **صفر أخطاء**.
+- `npx eslint .` → **صفر أخطاء** (4 تحذيرات قائمة مسبقًا في ملف اختبار غير مرتبط بهذه المرحلة، لم تُمس).
+- `npx vitest run` → **489/489 ناجح عبر 35 ملفًا** (يشمل 2 ملف Vitest جديد بالكامل لِPhase 9: حدود صلاحيات Server Actions + ثبات القيم كنصوص).
+- `npm run build` (Next.js/Turbopack) → **نجح**، بزيادة 3 مسارات: `/inventory`، `/inventory/items`، `/inventory/movements`.
+
+**لم يُنفَّذ فعليًا في هذه الجلسة (لا خادم Postgres متاح في بيئة التنفيذ):** `supabase/tests/inventory_core_phase9.test.sql` (اختبار SQL جديد بالكامل يغطي حدود الصلاحيات، منع الرصيد السالب، تزامن Optimistic عبر `row_version`، نطاق رؤية الفروع، وسجل التدقيق)، `supabase/tests/upgrade_phase9_inventory.test.sql` + `scripts/run_upgrade_test_phase9_inventory.sh` (إثبات مسار الترقية فوق `seed.sql` الحقيقي دون إعادة تشغيله)، و`scripts/check-numeric-column-types.ts` (يتطلب `DATABASE_URL` حي). كل هذه الملفات مكتوبة بالكامل وجاهزة، وتتبع بنية اختبارات SQL القائمة حرفيًا (`adjustments_core_phase6.test.sql`/`settlements_phase7.test.sql`)، لكن **لم تُشغَّل فعليًا بعد** — يجب تشغيلها يدويًا مقابل قاعدة Postgres حقيقية قبل اعتماد هذه المرحلة نهائيًا. لا اختبار HTTP/PostgREST جديد أو تزامن `dblink` حقيقي أُضيف لهذه المرحلة (النطاق المعتمد لم يطلب تعقيد التزامن الحقيقي متعدد الجلسات الذي غطّته اختبارات Phase 6/7 — الحارس هنا قفل استشاري واحد بسيط داخل RPC واحد، مغطّى منطقيًا في اختبار SQL أعلاه لكن ليس بسيناريو تزامن حقيقي متعدد الاتصالات).
+
+### 7) الملفات الجديدة/المُعدَّلة
+
+**ترحيلات جديدة (3):** `0227_inventory_permissions_and_locks.sql`، `0228_inventory_core_schema.sql`، `0229_inventory_core_rpcs.sql`.
+
+**اختبارات SQL جديدة بالكامل (غير مُشغَّلة فعليًا — انظر §6):** `supabase/tests/inventory_core_phase9.test.sql`، `supabase/tests/upgrade_phase9_inventory.test.sql`.
+
+**سكربتات جديدة:** `scripts/run_upgrade_test_phase9_inventory.sh`.
+
+**كود TypeScript جديد بالكامل:** `src/features/inventory/{schema,queries,actions}.ts`، `src/features/inventory/components/{inventory-item-form-dialog,inventory-receive-stock-dialog,inventory-adjust-stock-dialog,inventory-balances-filters,inventory-movements-filters}.tsx`، `src/app/(app)/inventory/page.tsx`، `src/app/(app)/inventory/items/page.tsx`، `src/app/(app)/inventory/movements/page.tsx`، `tests/inventory-actions-permission-boundary.test.ts`، `tests/inventory-money-string-invariant.test.ts`.
+
+**كود TypeScript مُعدَّل:** `src/types/database.ts` (جداول 2 غير موجودة فيه — الوصول حصرًا عبر RPCs — و10 دوال RPC جديدة)، `src/lib/permissions/constants.ts` (3 مفاتيح صلاحيات جديدة)، `src/lib/constants.ts` (`ROUTES.inventory`/`inventoryItems`/`inventoryMovements`)، `src/components/layout/nav-items.ts` (عنصر تنقل جديد "المخزون").
+
+**لم يتغيَّر إطلاقًا:** أي ترحيلة من 0001–0226، `supabase/seed.sql`، أي RPC من Sales/Returns/Settlements/Adjustments/Reports، أي اختبار قائم (لا حذف ولا إضعاف).
+
+**خلاصة الملحق الثامن والثلاثون:** نواة مخزون جديدة كليًا ومستقلة تمامًا عن المبيعات/المرتجعات — كتالوج أصناف عام، دفتر حركات إضافي-فقط مُقيَّد بالفرع برصيد مُشتق حيًّا لا مُخزَّن أبدًا، حارس منع رصيد سالب على مستوى القاعدة عبر قفل استشاري واحد مشترك، عمليات يدوية فقط (استلام/تصحيح) دون أي ربط تلقائي بالمبيعات، صلاحيات دقيقة الحبيبات (3 مفاتيح فقط حسب النطاق المعتمد). **489/489 Vitest + TypeScript/ESLint/بناء إنتاجي نظيفة بالكامل — من تشغيلات فعلية حقيقية في هذه الجلسة.** اختبارات SQL/تزامن/ترقية **مكتوبة بالكامل لكن غير مُشغَّلة فعليًا** لعدم توفر خادم Postgres في بيئة التنفيذ — يجب تشغيلها يدويًا قبل الاعتماد النهائي. لا تعديل واحد على أي ترحيلة من 0001–0226، ولا أي وحدة خارج النطاق المعتمد (Salla/Carrier/Bank API، GL/COGS، Attachments، Backups، 2FA، مزامنة، Forecasting/AI، CRM، Payroll، Purchasing، مصروفات الفروع). العمل متوقف الآن، بانتظار مراجعة المستخدم وتشغيل اختبارات SQL/الترقية مقابل قاعدة حقيقية.**
+
+---
+
 *نهاية التقرير.*

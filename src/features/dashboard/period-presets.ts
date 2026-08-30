@@ -120,8 +120,8 @@ export const CUSTOM_PERIOD_PRESET = "custom";
  * `report_calendar_comparison_period()` (0221) has a real calendar branch
  * for, while `last7`/`last30` fall into its generic equal-length `else`
  * branch. A deliberately-clicked "آخر 30 يومًا" is unaffected: its own key
- * is written into the URL (§2) and passes straight through above, never
- * reaching this list.
+ * is written into the URL (§2) and, while its dates still match that preset,
+ * is accepted before derivation.
  */
 const DERIVATION_PRIORITY = ["this_month", "last_month", "this_year", "last_year", "this_week", "last_week"];
 
@@ -131,26 +131,27 @@ const DERIVATION_PRIORITY = ["this_month", "last_month", "this_year", "last_year
  * actually is right now:
  *
  *  - §2 — a quick-period button writes its OWN key into `period_preset`
- *    alongside `date_from`/`date_to`; a known key is passed straight
- *    through, so "This Week" really does compare against the FULL previous
- *    Riyadh week rather than an equal-length slice of days.
+ *    alongside `date_from`/`date_to`; a known key is accepted only while
+ *    those dates still match that preset's own range. This prevents a stale
+ *    or hand-edited URL from claiming a calendar unit that its dates no
+ *    longer represent.
  *  - §3 — editing `date_from`/`date_to` by hand DELETES `period_preset`
- *    from the URL (`ReportFilterBar`'s `dateChangeClearKeys`), so a stale
- *    preset can never describe a range it no longer matches. With no preset
- *    present the range itself decides: an exact match against a preset's own
- *    from/to wins, otherwise `custom`.
+ *    from the URL (`ReportFilterBar`'s `dateChangeClearKeys`). As a second
+ *    line of defense, even a known-but-stale preset is re-derived from the
+ *    range rather than forwarded verbatim. An exact range match wins;
+ *    otherwise the result is `custom`.
  *  - §4 — the DEFAULT range (month start → today, the page's own fallback
  *    when the URL carries no dates at all) is byte-for-byte `this_month`'s
  *    own from/to, so it resolves to `this_month` through that same range
  *    match — the default Dashboard view compares against the full previous
  *    calendar month, never a 30-ish-day equal-length window.
  *
- * An UNKNOWN/hand-crafted preset key is never forwarded verbatim: it is
- * re-derived from the range exactly like an absent one.
+ * An UNKNOWN/hand-crafted preset key is also re-derived from the range.
  */
 export function resolveDashboardPeriodPreset(presetParam: string | undefined, dateFrom: string, dateTo: string, now: Date = riyadhNow()): string {
   const presets = buildPresets(now);
-  if (presetParam && presets.some((p) => p.key === presetParam)) return presetParam;
+  const declaredPreset = presetParam ? presets.find((p) => p.key === presetParam) : undefined;
+  if (declaredPreset && declaredPreset.from === dateFrom && declaredPreset.to === dateTo) return declaredPreset.key;
 
   const matches = presets.filter((p) => p.from === dateFrom && p.to === dateTo);
   if (matches.length === 0) return CUSTOM_PERIOD_PRESET;

@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 // so the Dashboard SERVER page can share it (see that file's header). The
 // component still renders exactly these presets; only the import path here
 // changed.
-import { buildPresets, ymd } from "@/features/dashboard/period-presets";
+import { buildPresets, CUSTOM_PERIOD_PRESET, resolveDashboardPeriodPreset, ymd } from "@/features/dashboard/period-presets";
 
 // Phase 8 Patch 8.1 §43-46 — Dashboard period presets. `buildPresets`
 // accepts a pinned `now` (a Date whose LOCAL getters already read as Riyadh
@@ -53,6 +53,20 @@ describe("features/dashboard/period-presets.ts — buildPresets", () => {
     const keys = presets.map((p) => p.key);
     expect(new Set(keys).size).toBe(keys.length);
     for (const p of presets) expect(p.label.length).toBeGreaterThan(0);
+  });
+});
+
+describe("features/dashboard/period-presets.ts — resolveDashboardPeriodPreset", () => {
+  it("accepts a declared preset only when its dates still match that preset", () => {
+    expect(resolveDashboardPeriodPreset("this_month", "2026-09-01", "2026-09-02", WED_SEP_2_2026)).toBe("this_month");
+  });
+
+  it("rejects a known but stale preset when the URL dates no longer match it", () => {
+    expect(resolveDashboardPeriodPreset("this_month", "2026-08-10", "2026-08-15", WED_SEP_2_2026)).toBe(CUSTOM_PERIOD_PRESET);
+  });
+
+  it("re-derives from the date range when a stale declared preset disagrees with a different valid preset", () => {
+    expect(resolveDashboardPeriodPreset("this_month", "2026-08-29", "2026-09-02", WED_SEP_2_2026)).toBe("this_week");
   });
 });
 

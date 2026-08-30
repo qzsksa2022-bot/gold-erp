@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - 'hotfix/**'
+      - 'phase/**'
   pull_request:
     branches:
       - main

@@ -463,6 +463,55 @@ begin
 end;
 $$;
 
+-- ---------------------------------------------------------------------------
+-- 8. acquire_inventory_item_store_lock() is internal-only (0230 fix) — an
+--    ordinary authenticated actor (any permission set) cannot call the
+--    advisory-lock helper directly, but receive/adjust RPCs (which call it
+--    internally via record_inventory_stock_movement()'s owner privileges)
+--    still work unaffected.
+-- ---------------------------------------------------------------------------
+set local request.jwt.claims = '{"sub":"a9000000-0000-4000-8000-000000000001","role":"authenticated"}';
+do $$
+begin
+  begin
+    perform public.acquire_inventory_item_store_lock(current_setting('p9t.item_1')::uuid, current_setting('p9t.store_a')::uuid);
+    raise exception 'TEST FAILED: an authenticated actor was able to call acquire_inventory_item_store_lock() directly';
+  exception
+    when insufficient_privilege then
+      null; -- expected: EXECUTE revoked from authenticated (0230)
+    when others then
+      raise exception 'TEST FAILED: acquire_inventory_item_store_lock() direct call rejected with an unexpected error (expected insufficient_privilege): %', sqlerrm;
+  end;
+end;
+$$;
+
+-- receive_inventory_stock()/adjust_inventory_stock() still work after the
+-- 0230 fix — the lock is still reachable via record_inventory_stock_
+-- movement()'s owner-privileged internal call.
+set local request.jwt.claims = '{"sub":"a9000000-0000-4000-8000-000000000003","role":"authenticated"}';
+do $$
+declare
+  v_balance text;
+begin
+  select resulting_balance into v_balance from public.receive_inventory_stock(current_setting('p9t.item_1')::uuid, current_setting('p9t.store_a')::uuid, 3, current_date, null, 'post-0230 sanity receipt');
+  if v_balance <> '3' then
+    raise exception 'TEST FAILED: receive_inventory_stock() stopped working after the 0230 EXECUTE revoke (expected resulting_balance=3, got %)', v_balance;
+  end if;
+end;
+$$;
+
+set local request.jwt.claims = '{"sub":"a9000000-0000-4000-8000-000000000004","role":"authenticated"}';
+do $$
+declare
+  v_balance text;
+begin
+  select resulting_balance into v_balance from public.adjust_inventory_stock(current_setting('p9t.item_1')::uuid, current_setting('p9t.store_a')::uuid, -3, 'post-0230 sanity adjustment', current_date, null);
+  if v_balance <> '0' then
+    raise exception 'TEST FAILED: adjust_inventory_stock() stopped working after the 0230 EXECUTE revoke (expected resulting_balance=0, got %)', v_balance;
+  end if;
+end;
+$$;
+
 reset role;
 rollback;
 

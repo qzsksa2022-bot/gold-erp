@@ -90,7 +90,11 @@ update public.profiles set full_name = 'Test P9 Upgrade Actor', status = 'active
   where id = 'a9999999-0000-4000-8000-000000000001';
 insert into public.user_permission_overrides (user_id, permission_id, effect)
   select 'a9999999-0000-4000-8000-000000000001', id, 'grant' from public.permissions
-  where key in ('stores.view', 'categories.view', 'categories.manage', 'inventory.view', 'inventory.receive', 'inventory.adjust');
+  -- `stores.create` is required by 0010's `stores_insert` RLS policy (WITH
+  -- CHECK has_permission('stores.create')) — the (B) usability block below
+  -- creates its own store as `authenticated`. `stores.view` alone only
+  -- satisfies the SELECT policy.
+  where key in ('stores.view', 'stores.create', 'categories.view', 'categories.manage', 'inventory.view', 'inventory.receive', 'inventory.adjust');
 
 set role authenticated;
 set local request.jwt.claims = '{"sub":"a9999999-0000-4000-8000-000000000001","role":"authenticated"}';
@@ -112,13 +116,16 @@ begin
   end if;
 
   select resulting_balance into v_balance from public.receive_inventory_stock(v_item_id, v_store, 20, current_date, 'PO-UPGRADE', null);
-  if v_balance <> '20' then
-    raise exception 'BUG: الرصيد المتوقع بعد الاستلام هو 20، وُجد %', v_balance;
+  -- `resulting_balance` is sum(quantity_delta)::text over numeric(12, 3)
+  -- (0228), returned as TEXT by 0229 on purpose — the expected string always
+  -- carries that column's own 3-decimal scale.
+  if v_balance <> '20.000' then
+    raise exception 'BUG: الرصيد المتوقع بعد الاستلام هو 20.000، وُجد %', v_balance;
   end if;
 
   select resulting_balance into v_balance from public.adjust_inventory_stock(v_item_id, v_store, -5, 'جرد فعلي بعد الترقية', current_date, null);
-  if v_balance <> '15' then
-    raise exception 'BUG: الرصيد المتوقع بعد التصحيح هو 15، وُجد %', v_balance;
+  if v_balance <> '15.000' then
+    raise exception 'BUG: الرصيد المتوقع بعد التصحيح هو 15.000، وُجد %', v_balance;
   end if;
 
   -- Negative-stock rejection is immediately enforced post-upgrade.

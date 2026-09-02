@@ -84,7 +84,15 @@ describe("src/features/inventory/**/*.{ts,tsx} — whole-directory scan, refine-
   const INVENTORY_DIR = path.join(process.cwd(), "src/features/inventory");
 
   function stripComments(source: string): string {
-    const withoutBlockComments = source.replace(/\/\*[\s\S]*?\*\//g, "");
+    // CRLF is normalized away FIRST. `.` in a JS regex matches any character
+    // except a line terminator, and `\r` is one — so on a CRLF checkout
+    // (git's default on Windows, via core.autocrlf) `/\/\/.*$/` never
+    // matches: `.*` stops before the trailing `\r` while `$` demands the end
+    // of the string. No `//` comment would be stripped at all, and the scan
+    // below then fails on comments that merely MENTION Number()/parseFloat()
+    // — which is exactly what schema.ts and actions.ts do when documenting
+    // this very invariant. The check stays identical on LF checkouts.
+    const withoutBlockComments = source.replace(/\r\n/g, "\n").replace(/\/\*[\s\S]*?\*\//g, "");
     return withoutBlockComments
       .split("\n")
       .map((line) => line.replace(/\/\/.*$/, ""))

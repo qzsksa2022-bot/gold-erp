@@ -86,7 +86,9 @@ update public.profiles set full_name = 'P9CC actor', status = 'active', store_ac
 
 insert into public.user_permission_overrides (user_id, permission_id, effect)
   select 'a9c00000-0000-4000-8000-000000000001', id, 'grant' from public.permissions
-  where key in ('categories.view', 'categories.manage', 'karats.view', 'karats.manage', 'inventory.view', 'inventory.receive', 'inventory.adjust');
+  -- `stores.create` is required by 0010's `stores_insert` RLS policy — the
+  -- fixture block below creates its own store as `authenticated`.
+  where key in ('stores.view', 'stores.create', 'categories.view', 'categories.manage', 'karats.view', 'karats.manage', 'inventory.view', 'inventory.receive', 'inventory.adjust');
 
 do $$
 declare
@@ -174,7 +176,10 @@ begin
   perform dblink_disconnect('conn_b');
 
   assert not v_a_failed, 'FAIL A: أول حركة سحب (10 - 6 = 4) كان يجب أن تنجح';
-  assert v_a_balance = '4', format('FAIL A: الرصيد بعد حركة A الأولى يجب أن يكون 4، الموجود: %s', v_a_balance);
+  -- `resulting_balance` is sum(quantity_delta)::text over numeric(12, 3)
+  -- (0228) — 0229 deliberately returns TEXT, so the exact string always
+  -- carries that column's own 3-decimal scale.
+  assert v_a_balance = '4.000', format('FAIL A: الرصيد بعد حركة A الأولى يجب أن يكون 4.000، الموجود: %s', v_a_balance);
   assert v_b_failed, 'FAIL A: ثاني حركة سحب متزامنة كان يجب أن تُرفض بعد إعادة تقييمها على الرصيد الفعلي بعد التزام A (4 - 6 = سالب)، لا أن تُقبل بناءً على قراءة قديمة (10) قبل حركة A';
 
   -- Authoritative proof: only A's movement committed. Verified via a fresh

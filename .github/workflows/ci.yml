@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - 'hotfix/**'
+      - 'phase/**'
   pull_request:
     branches:
       - main
@@ -54,3 +55,122 @@ jobs:
 
       - name: Production build
         run: npm run build
+
+  # ===========================================================================
+  # Phase 9 — REAL PostgreSQL verification.
+  # ===========================================================================
+  # The `verify` job above only ever exercised the TypeScript side. Every
+  # supabase/migrations/*.sql and supabase/tests/*.test.sql file was entirely
+  # unverified by CI, which is how Phase 9 shipped an RLS policy that made
+  # every direct SELECT on inventory_stock_movements fail (fixed in 0231) and
+  # an update_inventory_item() that failed on every call (fixed in 0232) — both
+  # apply cleanly, and only break when actually exercised against a live
+  # server. This job runs a genuine PostgreSQL 16 instance as a service and
+  # executes the migrations, the seed, and the Phase 9 SQL/upgrade/concurrency
+  # tests against it.
+  sql:
+    name: SQL & upgrade tests (PostgreSQL 16)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        # The official image ships postgresql-contrib, which is where `dblink`
+        # comes from — the multi-session concurrency test below needs it to
+        # open two genuinely independent server-side sessions.
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      # Consumed by scripts/run_upgrade_test_phase9_inventory.sh, which drops
+      # and recreates this database itself on every run.
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/gold_erp_phase9_upgrade_test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Verify server is reachable and dblink is available
+        run: |
+          psql -v ON_ERROR_STOP=1 -d postgres -c "select version();"
+          # Fail loudly here rather than deep inside the concurrency test if
+          # the image ever stops shipping contrib.
+          psql -v ON_ERROR_STOP=1 -d postgres -tAc \
+            "select 1 from pg_available_extensions where name = 'dblink';" | grep -q 1
+
+      - name: Create Supabase roles (cluster-wide)
+        # These exact role names are what every RLS policy and GRANT in
+        # supabase/migrations references; supabase/tests/local_harness_setup.sql
+        # documents this same bootstrap.
+        run: |
+          psql -v ON_ERROR_STOP=1 -d postgres -c "create role anon nologin;"
+          psql -v ON_ERROR_STOP=1 -d postgres -c "create role authenticated nologin;"
+          psql -v ON_ERROR_STOP=1 -d postgres -c "create role service_role nologin bypassrls;"
+
+      # ---------------------------------------------------------------------
+      # Database 1 — full current schema, for the single-transaction tests.
+      # ---------------------------------------------------------------------
+      - name: Build gold_erp_test (harness + all migrations + seed)
+        run: |
+          psql -v ON_ERROR_STOP=1 -d postgres -c 'create database gold_erp_test;'
+          psql -v ON_ERROR_STOP=1 -d gold_erp_test -q -f supabase/tests/local_harness_setup.sql
+          for f in supabase/migrations/*.sql; do
+            psql -v ON_ERROR_STOP=1 -d gold_erp_test -q -f "$f"
+          done
+          psql -v ON_ERROR_STOP=1 -d gold_erp_test -q -f supabase/seed.sql
+
+      - name: Phase 9 — inventory_core_phase9.test.sql
+        run: psql -v ON_ERROR_STOP=1 -d gold_erp_test -f supabase/tests/inventory_core_phase9.test.sql
+
+      # ---------------------------------------------------------------------
+      # Database 2 — the multi-session concurrency test. It runs with NO
+      # wrapping transaction (real dblink sessions, auto-committing) and
+      # leaves its fixtures behind by design, so it gets a database of its
+      # own rather than polluting the one above.
+      # ---------------------------------------------------------------------
+      - name: Build gold_erp_concurrency_test
+        run: |
+          psql -v ON_ERROR_STOP=1 -d postgres -c 'create database gold_erp_concurrency_test;'
+          psql -v ON_ERROR_STOP=1 -d gold_erp_concurrency_test -q -f supabase/tests/local_harness_setup.sql
+          for f in supabase/migrations/*.sql; do
+            psql -v ON_ERROR_STOP=1 -d gold_erp_concurrency_test -q -f "$f"
+          done
+          psql -v ON_ERROR_STOP=1 -d gold_erp_concurrency_test -q -f supabase/seed.sql
+          psql -v ON_ERROR_STOP=1 -d gold_erp_concurrency_test -c 'create extension if not exists dblink;'
+
+      - name: Phase 9 — inventory_core_phase9_concurrency.test.sql (two real sessions via dblink)
+        # dblink connects from the SERVER back to itself, so the conninfo is
+        # resolved inside the service container (127.0.0.1:5432 there), not
+        # from the runner. That is also this file's own default, passed
+        # explicitly so the dependency is visible rather than implied.
+        run: |
+          psql -v ON_ERROR_STOP=1 -d gold_erp_concurrency_test \
+            -v "dblink_conninfo=host=127.0.0.1 port=5432 user=postgres password=postgres" \
+            -f supabase/tests/inventory_core_phase9_concurrency.test.sql
+
+      # ---------------------------------------------------------------------
+      # Database 3 — the production upgrade path (0226 + real seed, THEN
+      # 0227+ on top in a separate psql invocation). The script builds and
+      # drops this database itself.
+      # ---------------------------------------------------------------------
+      - name: Phase 9 — upgrade test (scripts/run_upgrade_test_phase9_inventory.sh)
+        run: bash scripts/run_upgrade_test_phase9_inventory.sh

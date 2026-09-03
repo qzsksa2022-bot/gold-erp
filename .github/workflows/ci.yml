@@ -57,7 +57,7 @@ jobs:
         run: npm run build
 
   # ===========================================================================
-  # Phase 9 — REAL PostgreSQL verification.
+  # REAL PostgreSQL verification — the ENTIRE SQL suite.
   # ===========================================================================
   # The `verify` job above only ever exercised the TypeScript side. Every
   # supabase/migrations/*.sql and supabase/tests/*.test.sql file was entirely
@@ -65,11 +65,16 @@ jobs:
   # every direct SELECT on inventory_stock_movements fail (fixed in 0231) and
   # an update_inventory_item() that failed on every call (fixed in 0232) — both
   # apply cleanly, and only break when actually exercised against a live
-  # server. This job runs a genuine PostgreSQL 16 instance as a service and
-  # executes the migrations, the seed, and the Phase 9 SQL/upgrade/concurrency
-  # tests against it.
+  # server.
+  #
+  # This job runs a genuine PostgreSQL 16 instance as a service and executes
+  # ALL THREE kinds of SQL suite against it, each the way it is meant to run:
+  #   * regular      — one pristine database clone per file
+  #   * concurrency  — one clone per file, plus dblink, two real sessions
+  #   * upgrade      — each script builds its own historical baseline
+  # No file is skipped and no step uses continue-on-error.
   sql:
-    name: SQL & upgrade tests (PostgreSQL 16)
+    name: SQL suite — regular, concurrency, upgrade (PostgreSQL 16)
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -96,13 +101,54 @@ jobs:
       PGPORT: "5432"
       PGUSER: postgres
       PGPASSWORD: postgres
-      # Consumed by scripts/run_upgrade_test_phase9_inventory.sh, which drops
-      # and recreates this database itself on every run.
-      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/gold_erp_phase9_upgrade_test
+      # NOTE: DATABASE_URL is deliberately NOT set here. Every upgrade script
+      # drops and recreates whatever database its own DATABASE_URL names, so a
+      # single shared value would make the scripts overwrite each other's
+      # database; the "Run upgrade suites" step below sets a distinct one per
+      # script instead.
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Pure file check — no database needed, so it runs first and fails fast.
+      - name: SQL test coverage (no orphaned test files)
+        # supabase/tests/upgrade_phase8_reports_dashboard.test.sql sat in the
+        # repository with no runner script for its whole life: it was never
+        # executed anywhere, by anyone, and nothing noticed. This step makes
+        # that class of gap impossible — every *.test.sql must be reachable by
+        # a concrete execution path:
+        #   *concurrency*.test.sql -> the concurrency loop below
+        #   upgrade_*.test.sql     -> MUST be named by some scripts/*.sh runner
+        #   everything else        -> the regular loop below
+        # Note it validates the TEST files. A runner that deliberately asserts
+        # a MIGRATION fails and so runs no .test.sql at all
+        # (run_upgrade_test_hotfix_7_1_3_broken_fixture.sh) is correctly not
+        # flagged here: it is a script, not an unreferenced test file, and it
+        # is executed by the upgrade loop like every other runner.
+        run: |
+          set -euo pipefail
+          orphans=0
+          for f in supabase/tests/*.test.sql; do
+            base="$(basename "$f")"
+            case "$base" in
+              *concurrency*) continue ;;
+              upgrade_*)
+                if grep -rqF -- "$base" scripts/*.sh; then
+                  echo "ok (upgrade runner found): $base"
+                else
+                  echo "ORPHAN: $base has no runner in scripts/*.sh — it would never execute"
+                  orphans=1
+                fi
+                ;;
+              *) continue ;;
+            esac
+          done
+          if [ "$orphans" -ne 0 ]; then
+            echo "FAILED: at least one SQL test file has no execution path."
+            exit 1
+          fi
+          echo "All SQL test files are wired to an execution path."
 
       - name: Install PostgreSQL client
         run: |
@@ -127,50 +173,117 @@ jobs:
           psql -v ON_ERROR_STOP=1 -d postgres -c "create role service_role nologin bypassrls;"
 
       # ---------------------------------------------------------------------
-      # Database 1 — full current schema, for the single-transaction tests.
+      # TEMPLATE database — built ONCE, then cloned per test.
       # ---------------------------------------------------------------------
-      - name: Build gold_erp_test (harness + all migrations + seed)
+      # Isolation matters here: several suites commit real rows (the
+      # concurrency files run with no wrapping transaction at all), and many
+      # share fixed fixture UUIDs, so running them against one shared database
+      # would let one test's leftovers decide another's outcome. Rebuilding 232
+      # migrations + seed per test would cost minutes each, so the schema is
+      # built once into a TEMPLATE and every test gets a byte-identical clone
+      # via `CREATE DATABASE ... TEMPLATE` (a file-level copy, ~a second).
+      # Each test therefore starts from exactly the same pristine state and
+      # cannot observe any other test.
+      - name: Build template database (harness + all migrations + seed)
         run: |
-          psql -v ON_ERROR_STOP=1 -d postgres -c 'create database gold_erp_test;'
-          psql -v ON_ERROR_STOP=1 -d gold_erp_test -q -f supabase/tests/local_harness_setup.sql
+          psql -v ON_ERROR_STOP=1 -d postgres -c 'create database gold_erp_template;'
+          psql -v ON_ERROR_STOP=1 -d gold_erp_template -q -f supabase/tests/local_harness_setup.sql
           for f in supabase/migrations/*.sql; do
-            psql -v ON_ERROR_STOP=1 -d gold_erp_test -q -f "$f"
+            psql -v ON_ERROR_STOP=1 -d gold_erp_template -q -f "$f"
           done
-          psql -v ON_ERROR_STOP=1 -d gold_erp_test -q -f supabase/seed.sql
-
-      - name: Phase 9 — inventory_core_phase9.test.sql
-        run: psql -v ON_ERROR_STOP=1 -d gold_erp_test -f supabase/tests/inventory_core_phase9.test.sql
+          psql -v ON_ERROR_STOP=1 -d gold_erp_template -q -f supabase/seed.sql
 
       # ---------------------------------------------------------------------
-      # Database 2 — the multi-session concurrency test. It runs with NO
-      # wrapping transaction (real dblink sessions, auto-committing) and
-      # leaves its fixtures behind by design, so it gets a database of its
-      # own rather than polluting the one above.
+      # Regular suites — one clean clone each.
       # ---------------------------------------------------------------------
-      - name: Build gold_erp_concurrency_test
+      # Every *.test.sql that is not a concurrency or upgrade file. `set -e`
+      # plus ON_ERROR_STOP means the first failing file fails the job; there
+      # is deliberately no continue-on-error and no skip list anywhere in this
+      # job.
+      - name: Run regular SQL suites
         run: |
-          psql -v ON_ERROR_STOP=1 -d postgres -c 'create database gold_erp_concurrency_test;'
-          psql -v ON_ERROR_STOP=1 -d gold_erp_concurrency_test -q -f supabase/tests/local_harness_setup.sql
-          for f in supabase/migrations/*.sql; do
-            psql -v ON_ERROR_STOP=1 -d gold_erp_concurrency_test -q -f "$f"
+          set -euo pipefail
+          fail=0
+          for f in supabase/tests/*.test.sql; do
+            base="$(basename "$f" .test.sql)"
+            case "$base" in
+              *concurrency*|upgrade_*) continue ;;
+            esac
+            db="t_$(echo "$base" | tr -c 'a-zA-Z0-9' '_' | cut -c1-50)"
+            echo "::group::$base"
+            psql -v ON_ERROR_STOP=1 -d postgres -q -c "create database $db template gold_erp_template;"
+            if psql -v ON_ERROR_STOP=1 -d "$db" -f "$f"; then
+              echo "PASS $base"
+            else
+              echo "FAIL $base"
+              fail=1
+            fi
+            psql -v ON_ERROR_STOP=1 -d postgres -q -c "drop database $db;"
+            echo "::endgroup::"
           done
-          psql -v ON_ERROR_STOP=1 -d gold_erp_concurrency_test -q -f supabase/seed.sql
-          psql -v ON_ERROR_STOP=1 -d gold_erp_concurrency_test -c 'create extension if not exists dblink;'
+          exit $fail
 
-      - name: Phase 9 — inventory_core_phase9_concurrency.test.sql (two real sessions via dblink)
-        # dblink connects from the SERVER back to itself, so the conninfo is
-        # resolved inside the service container (127.0.0.1:5432 there), not
-        # from the runner. That is also this file's own default, passed
-        # explicitly so the dependency is visible rather than implied.
+      # ---------------------------------------------------------------------
+      # Concurrency suites — one clean clone each, plus dblink.
+      # ---------------------------------------------------------------------
+      # These open two genuinely independent server-side sessions through
+      # dblink and assert on real lock contention, so they must never share a
+      # database with anything else. dblink connects from the SERVER back to
+      # itself, so the conninfo resolves inside the service container
+      # (127.0.0.1:5432 there), not from the runner.
+      #
+      # POSTGRES_PASSWORD above is load-bearing for these: dblink refuses a
+      # connection opened by a NON-superuser (several of these files call
+      # dblink_connect after `set local role authenticated`) unless the
+      # connection actually authenticated with a password. A trust-auth server
+      # fails them with "password or GSSAPI delegated credentials required"
+      # even though a password was supplied.
+      - name: Run concurrency SQL suites (two real sessions via dblink)
         run: |
-          psql -v ON_ERROR_STOP=1 -d gold_erp_concurrency_test \
-            -v "dblink_conninfo=host=127.0.0.1 port=5432 user=postgres password=postgres" \
-            -f supabase/tests/inventory_core_phase9_concurrency.test.sql
+          set -euo pipefail
+          fail=0
+          for f in supabase/tests/*concurrency*.test.sql; do
+            base="$(basename "$f" .test.sql)"
+            db="c_$(echo "$base" | tr -c 'a-zA-Z0-9' '_' | cut -c1-50)"
+            echo "::group::$base"
+            psql -v ON_ERROR_STOP=1 -d postgres -q -c "create database $db template gold_erp_template;"
+            psql -v ON_ERROR_STOP=1 -d "$db" -q -c 'create extension if not exists dblink;'
+            if psql -v ON_ERROR_STOP=1 -d "$db" \
+                 -v "dblink_conninfo=host=127.0.0.1 port=5432 user=postgres password=postgres" \
+                 -f "$f"; then
+              echo "PASS $base"
+            else
+              echo "FAIL $base"
+              fail=1
+            fi
+            psql -v ON_ERROR_STOP=1 -d postgres -q -c "drop database $db;"
+            echo "::endgroup::"
+          done
+          exit $fail
 
       # ---------------------------------------------------------------------
-      # Database 3 — the production upgrade path (0226 + real seed, THEN
-      # 0227+ on top in a separate psql invocation). The script builds and
-      # drops this database itself.
+      # Upgrade suites — each script builds its OWN baseline.
       # ---------------------------------------------------------------------
-      - name: Phase 9 — upgrade test (scripts/run_upgrade_test_phase9_inventory.sh)
-        run: bash scripts/run_upgrade_test_phase9_inventory.sh
+      # These cannot use the template: each one deliberately builds a database
+      # up to a specific historical migration, applies the REAL seed.sql at
+      # that point, then applies the newer migrations on top in a separate
+      # psql invocation — reproducing what a production upgrade actually
+      # experiences. Each script drops/recreates the database named in its own
+      # DATABASE_URL, so each script gets a distinct database name.
+      - name: Run upgrade suites
+        run: |
+          set -euo pipefail
+          fail=0
+          for s in scripts/run_upgrade_test*.sh; do
+            base="$(basename "$s" .sh)"
+            db="u_$(echo "$base" | tr -c 'a-zA-Z0-9' '_' | cut -c1-50)"
+            echo "::group::$base"
+            if DATABASE_URL="postgresql://postgres:postgres@127.0.0.1:5432/$db" bash "$s"; then
+              echo "PASS $base"
+            else
+              echo "FAIL $base"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $fail

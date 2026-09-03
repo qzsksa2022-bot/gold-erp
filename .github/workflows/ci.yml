@@ -149,6 +149,7 @@ jobs:
             exit 1
           fi
           echo "All SQL test files are wired to an execution path."
+          exit 0
 
       - name: Install PostgreSQL client
         run: |
@@ -201,27 +202,62 @@ jobs:
       # is deliberately no continue-on-error and no skip list anywhere in this
       # job.
       - name: Run regular SQL suites
+        # Loop accounting rules, applied identically to all three SQL steps:
+        #   * `set -e` is NOT used. Under it, a non-zero status from a cleanup
+        #     command (the post-test DROP DATABASE) aborts the whole step
+        #     immediately, which surfaces as "the last test passed, then the
+        #     step exited 1" with no FAIL line anywhere. Every command's status
+        #     is now checked explicitly instead.
+        #   * counters use `n=$((n + 1))`, never `((n++))` — the latter
+        #     evaluates to the OLD value, so incrementing from 0 returns status
+        #     1 and would abort the step under `set -e`.
+        #   * PASS/FAIL is printed AFTER ::endgroup:: so it can never be hidden
+        #     inside a collapsed group, and every failure is repeated in the
+        #     summary at the end.
+        #   * the step ends with an explicit `exit 1` / `exit 0`, never with a
+        #     bare condition or arithmetic expression whose status leaks out.
+        #   * cleanup is best-effort and never decides the outcome; a real test
+        #     failure is still always fatal to the step.
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          pass=0
           fail=0
+          failed=""
           for f in supabase/tests/*.test.sql; do
             base="$(basename "$f" .test.sql)"
             case "$base" in
               *concurrency*|upgrade_*) continue ;;
             esac
             db="t_$(echo "$base" | tr -c 'a-zA-Z0-9' '_' | cut -c1-50)"
+            ok=1
             echo "::group::$base"
-            psql -v ON_ERROR_STOP=1 -d postgres -q -c "create database $db template gold_erp_template;"
-            if psql -v ON_ERROR_STOP=1 -d "$db" -f "$f"; then
+            if ! psql -v ON_ERROR_STOP=1 -d postgres -q -c "create database $db template gold_erp_template;"; then
+              echo "could not create database $db"
+              ok=0
+            fi
+            if [ "$ok" -eq 1 ]; then
+              if ! psql -v ON_ERROR_STOP=1 -d "$db" -f "$f"; then
+                ok=0
+              fi
+            fi
+            psql -d postgres -q -c "drop database if exists $db with (force);" >/dev/null 2>&1 || true
+            echo "::endgroup::"
+            if [ "$ok" -eq 1 ]; then
+              pass=$((pass + 1))
               echo "PASS $base"
             else
+              fail=$((fail + 1))
+              failed="$failed $base"
               echo "FAIL $base"
-              fail=1
             fi
-            psql -v ON_ERROR_STOP=1 -d postgres -q -c "drop database $db;"
-            echo "::endgroup::"
           done
-          exit $fail
+          echo "--------------------------------------------------"
+          echo "regular SQL suites: $pass passed, $fail failed"
+          if [ "$fail" -ne 0 ]; then
+            echo "FAILED:$failed"
+            exit 1
+          fi
+          exit 0
 
       # ---------------------------------------------------------------------
       # Concurrency suites — one clean clone each, plus dblink.
@@ -239,27 +275,59 @@ jobs:
       # fails them with "password or GSSAPI delegated credentials required"
       # even though a password was supplied.
       - name: Run concurrency SQL suites (two real sessions via dblink)
+        # Same accounting rules as the regular step above. The cleanup DROP
+        # matters more here than anywhere else: these files open real dblink
+        # sessions against the very database being dropped, so a backend that
+        # has not finished exiting makes a plain DROP DATABASE fail with
+        # "database is being accessed by other users". Under the previous
+        # `set -e` that turned a fully passing run into a step failure right
+        # after the last PASS line. It is now `WITH (FORCE)` (PostgreSQL 13+,
+        # terminates leftover backends) and best-effort.
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          pass=0
           fail=0
+          failed=""
           for f in supabase/tests/*concurrency*.test.sql; do
             base="$(basename "$f" .test.sql)"
             db="c_$(echo "$base" | tr -c 'a-zA-Z0-9' '_' | cut -c1-50)"
+            ok=1
             echo "::group::$base"
-            psql -v ON_ERROR_STOP=1 -d postgres -q -c "create database $db template gold_erp_template;"
-            psql -v ON_ERROR_STOP=1 -d "$db" -q -c 'create extension if not exists dblink;'
-            if psql -v ON_ERROR_STOP=1 -d "$db" \
-                 -v "dblink_conninfo=host=127.0.0.1 port=5432 user=postgres password=postgres" \
-                 -f "$f"; then
+            if ! psql -v ON_ERROR_STOP=1 -d postgres -q -c "create database $db template gold_erp_template;"; then
+              echo "could not create database $db"
+              ok=0
+            fi
+            if [ "$ok" -eq 1 ]; then
+              if ! psql -v ON_ERROR_STOP=1 -d "$db" -q -c 'create extension if not exists dblink;'; then
+                echo "could not create dblink extension in $db"
+                ok=0
+              fi
+            fi
+            if [ "$ok" -eq 1 ]; then
+              if ! psql -v ON_ERROR_STOP=1 -d "$db" \
+                   -v "dblink_conninfo=host=127.0.0.1 port=5432 user=postgres password=postgres" \
+                   -f "$f"; then
+                ok=0
+              fi
+            fi
+            psql -d postgres -q -c "drop database if exists $db with (force);" >/dev/null 2>&1 || true
+            echo "::endgroup::"
+            if [ "$ok" -eq 1 ]; then
+              pass=$((pass + 1))
               echo "PASS $base"
             else
+              fail=$((fail + 1))
+              failed="$failed $base"
               echo "FAIL $base"
-              fail=1
             fi
-            psql -v ON_ERROR_STOP=1 -d postgres -q -c "drop database $db;"
-            echo "::endgroup::"
           done
-          exit $fail
+          echo "--------------------------------------------------"
+          echo "concurrency SQL suites: $pass passed, $fail failed"
+          if [ "$fail" -ne 0 ]; then
+            echo "FAILED:$failed"
+            exit 1
+          fi
+          exit 0
 
       # ---------------------------------------------------------------------
       # Upgrade suites — each script builds its OWN baseline.
@@ -271,19 +339,39 @@ jobs:
       # experiences. Each script drops/recreates the database named in its own
       # DATABASE_URL, so each script gets a distinct database name.
       - name: Run upgrade suites
+        # Same accounting rules as the two steps above. Note each script is
+        # itself `set -euo pipefail` internally and returns non-zero on
+        # failure, which is exactly what is checked here — including the
+        # deliberately negative runner, which returns non-zero only if the
+        # migration it expects to abort unexpectedly SUCCEEDS.
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          pass=0
           fail=0
+          failed=""
           for s in scripts/run_upgrade_test*.sh; do
             base="$(basename "$s" .sh)"
             db="u_$(echo "$base" | tr -c 'a-zA-Z0-9' '_' | cut -c1-50)"
+            ok=1
             echo "::group::$base"
-            if DATABASE_URL="postgresql://postgres:postgres@127.0.0.1:5432/$db" bash "$s"; then
+            if ! DATABASE_URL="postgresql://postgres:postgres@127.0.0.1:5432/$db" bash "$s"; then
+              ok=0
+            fi
+            psql -d postgres -q -c "drop database if exists $db with (force);" >/dev/null 2>&1 || true
+            echo "::endgroup::"
+            if [ "$ok" -eq 1 ]; then
+              pass=$((pass + 1))
               echo "PASS $base"
             else
+              fail=$((fail + 1))
+              failed="$failed $base"
               echo "FAIL $base"
-              fail=1
             fi
-            echo "::endgroup::"
           done
-          exit $fail
+          echo "--------------------------------------------------"
+          echo "upgrade SQL suites: $pass passed, $fail failed"
+          if [ "$fail" -ne 0 ]; then
+            echo "FAILED:$failed"
+            exit 1
+          fi
+          exit 0

@@ -57,7 +57,7 @@ jobs:
         run: npm run build
 
   # ===========================================================================
-  # Phase 9 — REAL PostgreSQL verification.
+  # REAL PostgreSQL verification — the ENTIRE SQL suite.
   # ===========================================================================
   # The `verify` job above only ever exercised the TypeScript side. Every
   # supabase/migrations/*.sql and supabase/tests/*.test.sql file was entirely
@@ -65,11 +65,16 @@ jobs:
   # every direct SELECT on inventory_stock_movements fail (fixed in 0231) and
   # an update_inventory_item() that failed on every call (fixed in 0232) — both
   # apply cleanly, and only break when actually exercised against a live
-  # server. This job runs a genuine PostgreSQL 16 instance as a service and
-  # executes the migrations, the seed, and the Phase 9 SQL/upgrade/concurrency
-  # tests against it.
+  # server.
+  #
+  # This job runs a genuine PostgreSQL 16 instance as a service and executes
+  # ALL THREE kinds of SQL suite against it, each the way it is meant to run:
+  #   * regular      — one pristine database clone per file
+  #   * concurrency  — one clone per file, plus dblink, two real sessions
+  #   * upgrade      — each script builds its own historical baseline
+  # No file is skipped and no step uses continue-on-error.
   sql:
-    name: SQL & upgrade tests (PostgreSQL 16)
+    name: SQL suite — regular, concurrency, upgrade (PostgreSQL 16)
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -83,6 +88,42 @@ jobs:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: postgres
+          # --------------------------------------------------------------
+          # Why both of these are required, and why the default is wrong.
+          # --------------------------------------------------------------
+          # The concurrency suites open dblink sessions from the SERVER back
+          # to itself at 127.0.0.1, after `set local role authenticated`.
+          # dblink refuses a connection opened by a non-superuser unless that
+          # connection actually AUTHENTICATED WITH A PASSWORD, so those two
+          # files failed with:
+          #   password or GSSAPI delegated credentials required
+          #   Non-superusers may only connect using credentials they provide
+          #
+          # Nothing here ever set POSTGRES_HOST_AUTH_METHOD=trust. The trust
+          # came from initdb itself: its default --auth-host is `trust`, so
+          # the generated pg_hba.conf begins with
+          #     host all all 127.0.0.1/32 trust
+          #     host all all ::1/128      trust
+          # and the official entrypoint only APPENDS its own
+          #     host all all all <POSTGRES_HOST_AUTH_METHOD>
+          # at the end. pg_hba.conf is FIRST-MATCH-WINS, so the container's
+          # own loopback — precisely the address dblink dials — matched the
+          # trust line and never consumed the password.
+          #
+          # This is also why nothing else in this job ever noticed: psql runs
+          # on the RUNNER, so its packets arrive from the docker bridge
+          # address, not 127.0.0.1, and matched the appended scram rule.
+          #
+          # POSTGRES_INITDB_ARGS is the part that actually fixes it — it makes
+          # initdb write the loopback rules as scram-sha-256 in the first
+          # place. `local` (unix socket) is deliberately left at trust: the
+          # image's own entrypoint initialises the cluster over the socket
+          # with --no-password, and forcing a password there breaks startup.
+          # POSTGRES_HOST_AUTH_METHOD is set explicitly so the appended
+          # catch-all rule is pinned too, rather than relying on the image's
+          # default staying scram-sha-256.
+          POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+          POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
         ports:
           - 5432:5432
         options: >-
@@ -96,13 +137,55 @@ jobs:
       PGPORT: "5432"
       PGUSER: postgres
       PGPASSWORD: postgres
-      # Consumed by scripts/run_upgrade_test_phase9_inventory.sh, which drops
-      # and recreates this database itself on every run.
-      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/gold_erp_phase9_upgrade_test
+      # NOTE: DATABASE_URL is deliberately NOT set here. Every upgrade script
+      # drops and recreates whatever database its own DATABASE_URL names, so a
+      # single shared value would make the scripts overwrite each other's
+      # database; the "Run upgrade suites" step below sets a distinct one per
+      # script instead.
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Pure file check — no database needed, so it runs first and fails fast.
+      - name: SQL test coverage (no orphaned test files)
+        # supabase/tests/upgrade_phase8_reports_dashboard.test.sql sat in the
+        # repository with no runner script for its whole life: it was never
+        # executed anywhere, by anyone, and nothing noticed. This step makes
+        # that class of gap impossible — every *.test.sql must be reachable by
+        # a concrete execution path:
+        #   *concurrency*.test.sql -> the concurrency loop below
+        #   upgrade_*.test.sql     -> MUST be named by some scripts/*.sh runner
+        #   everything else        -> the regular loop below
+        # Note it validates the TEST files. A runner that deliberately asserts
+        # a MIGRATION fails and so runs no .test.sql at all
+        # (run_upgrade_test_hotfix_7_1_3_broken_fixture.sh) is correctly not
+        # flagged here: it is a script, not an unreferenced test file, and it
+        # is executed by the upgrade loop like every other runner.
+        run: |
+          set -euo pipefail
+          orphans=0
+          for f in supabase/tests/*.test.sql; do
+            base="$(basename "$f")"
+            case "$base" in
+              *concurrency*) continue ;;
+              upgrade_*)
+                if grep -rqF -- "$base" scripts/*.sh; then
+                  echo "ok (upgrade runner found): $base"
+                else
+                  echo "ORPHAN: $base has no runner in scripts/*.sh — it would never execute"
+                  orphans=1
+                fi
+                ;;
+              *) continue ;;
+            esac
+          done
+          if [ "$orphans" -ne 0 ]; then
+            echo "FAILED: at least one SQL test file has no execution path."
+            exit 1
+          fi
+          echo "All SQL test files are wired to an execution path."
+          exit 0
 
       - name: Install PostgreSQL client
         run: |
@@ -117,6 +200,76 @@ jobs:
           psql -v ON_ERROR_STOP=1 -d postgres -tAc \
             "select 1 from pg_available_extensions where name = 'dblink';" | grep -q 1
 
+      # Runs BEFORE the (expensive) template build, so a mis-provisioned
+      # server fails the job in seconds with an unambiguous message rather
+      # than surfacing much later as a confusing dblink error inside two
+      # specific concurrency suites.
+      - name: Verify host authentication really uses a password (not trust)
+        run: |
+          set -uo pipefail
+
+          echo "1) the correct password over TCP must be ACCEPTED"
+          if ! PGPASSWORD=postgres psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -tAc 'select 1' >/dev/null; then
+            echo "FAILED: could not connect with the correct password."
+            exit 1
+          fi
+          echo "   ok"
+
+          echo "2) a wrong password over TCP must be REJECTED"
+          if PGPASSWORD=deliberately-wrong-password psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -tAc 'select 1' >/dev/null 2>&1; then
+            echo "FAILED: the server ACCEPTED a wrong password over TCP — host auth is trust, not password-based."
+            echo "        dblink would then refuse every non-superuser connection the concurrency suites make."
+            exit 1
+          fi
+          echo "   ok (rejected)"
+
+          # Checks 1 and 2 run from the RUNNER, whose packets arrive from the
+          # docker bridge address — they can never match the 127.0.0.1/32
+          # rule that dblink actually uses. This check reads the server's own
+          # parsed rule table, which covers the loopback path directly.
+          echo "3) no host rule may still use trust (this is the loopback path dblink dials)"
+          trust_rules="$(PGPASSWORD=postgres psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -tAc \
+            "select count(*) from pg_hba_file_rules where type like 'host%' and auth_method = 'trust';")"
+          if [ "$trust_rules" != "0" ]; then
+            echo "FAILED: $trust_rules host rule(s) still use trust:"
+            PGPASSWORD=postgres psql -h 127.0.0.1 -p 5432 -U postgres -d postgres \
+              -c "select line_number, type, database, user_name, address, auth_method from pg_hba_file_rules order by line_number;"
+            exit 1
+          fi
+          echo "   ok (0 trust host rules)"
+
+          echo "4) a NON-superuser dblink connection over the container's own loopback must work — the exact path the concurrency suites use"
+          PGPASSWORD=postgres psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -p 5432 -U postgres -d postgres -q -c "
+            create extension if not exists dblink;
+            create role dblink_auth_probe nologin;
+            do \$\$
+            declare v int;
+            begin
+              -- Mirrors the suites exactly: a non-superuser calling dblink.
+              set local role dblink_auth_probe;
+              perform dblink_connect('probe', 'host=127.0.0.1 port=5432 user=postgres password=postgres dbname=postgres');
+              select x into v from dblink('probe', 'select 1') as t(x int);
+              perform dblink_disconnect('probe');
+              if v is distinct from 1 then
+                raise exception 'dblink probe returned %, expected 1', v;
+              end if;
+            end \$\$;
+            -- psql -c sends these as ONE implicit transaction, so the DO
+            -- block's \`set local role\` is still in effect here. Without this
+            -- reset, the DROP below runs as the (non-superuser) probe role
+            -- and fails with 'permission denied to drop role'.
+            reset role;
+            drop role dblink_auth_probe;
+          "
+          if [ $? -ne 0 ]; then
+            echo "FAILED: a non-superuser dblink connection over 127.0.0.1 did not succeed."
+            exit 1
+          fi
+          echo "   ok"
+
+          echo "host authentication verified: passwords are genuinely required."
+          exit 0
+
       - name: Create Supabase roles (cluster-wide)
         # These exact role names are what every RLS policy and GRANT in
         # supabase/migrations references; supabase/tests/local_harness_setup.sql
@@ -127,50 +280,204 @@ jobs:
           psql -v ON_ERROR_STOP=1 -d postgres -c "create role service_role nologin bypassrls;"
 
       # ---------------------------------------------------------------------
-      # Database 1 — full current schema, for the single-transaction tests.
+      # TEMPLATE database — built ONCE, then cloned per test.
       # ---------------------------------------------------------------------
-      - name: Build gold_erp_test (harness + all migrations + seed)
+      # Isolation matters here: several suites commit real rows (the
+      # concurrency files run with no wrapping transaction at all), and many
+      # share fixed fixture UUIDs, so running them against one shared database
+      # would let one test's leftovers decide another's outcome. Rebuilding 232
+      # migrations + seed per test would cost minutes each, so the schema is
+      # built once into a TEMPLATE and every test gets a byte-identical clone
+      # via `CREATE DATABASE ... TEMPLATE` (a file-level copy, ~a second).
+      # Each test therefore starts from exactly the same pristine state and
+      # cannot observe any other test.
+      - name: Build template database (harness + all migrations + seed)
         run: |
-          psql -v ON_ERROR_STOP=1 -d postgres -c 'create database gold_erp_test;'
-          psql -v ON_ERROR_STOP=1 -d gold_erp_test -q -f supabase/tests/local_harness_setup.sql
+          psql -v ON_ERROR_STOP=1 -d postgres -c 'create database gold_erp_template;'
+          psql -v ON_ERROR_STOP=1 -d gold_erp_template -q -f supabase/tests/local_harness_setup.sql
           for f in supabase/migrations/*.sql; do
-            psql -v ON_ERROR_STOP=1 -d gold_erp_test -q -f "$f"
+            psql -v ON_ERROR_STOP=1 -d gold_erp_template -q -f "$f"
           done
-          psql -v ON_ERROR_STOP=1 -d gold_erp_test -q -f supabase/seed.sql
-
-      - name: Phase 9 — inventory_core_phase9.test.sql
-        run: psql -v ON_ERROR_STOP=1 -d gold_erp_test -f supabase/tests/inventory_core_phase9.test.sql
+          psql -v ON_ERROR_STOP=1 -d gold_erp_template -q -f supabase/seed.sql
 
       # ---------------------------------------------------------------------
-      # Database 2 — the multi-session concurrency test. It runs with NO
-      # wrapping transaction (real dblink sessions, auto-committing) and
-      # leaves its fixtures behind by design, so it gets a database of its
-      # own rather than polluting the one above.
+      # Regular suites — one clean clone each.
       # ---------------------------------------------------------------------
-      - name: Build gold_erp_concurrency_test
+      # Every *.test.sql that is not a concurrency or upgrade file. `set -e`
+      # plus ON_ERROR_STOP means the first failing file fails the job; there
+      # is deliberately no continue-on-error and no skip list anywhere in this
+      # job.
+      - name: Run regular SQL suites
+        # Loop accounting rules, applied identically to all three SQL steps:
+        #   * `set -e` is NOT used. Under it, a non-zero status from a cleanup
+        #     command (the post-test DROP DATABASE) aborts the whole step
+        #     immediately, which surfaces as "the last test passed, then the
+        #     step exited 1" with no FAIL line anywhere. Every command's status
+        #     is now checked explicitly instead.
+        #   * counters use `n=$((n + 1))`, never `((n++))` — the latter
+        #     evaluates to the OLD value, so incrementing from 0 returns status
+        #     1 and would abort the step under `set -e`.
+        #   * PASS/FAIL is printed AFTER ::endgroup:: so it can never be hidden
+        #     inside a collapsed group, and every failure is repeated in the
+        #     summary at the end.
+        #   * the step ends with an explicit `exit 1` / `exit 0`, never with a
+        #     bare condition or arithmetic expression whose status leaks out.
+        #   * cleanup is best-effort and never decides the outcome; a real test
+        #     failure is still always fatal to the step.
         run: |
-          psql -v ON_ERROR_STOP=1 -d postgres -c 'create database gold_erp_concurrency_test;'
-          psql -v ON_ERROR_STOP=1 -d gold_erp_concurrency_test -q -f supabase/tests/local_harness_setup.sql
-          for f in supabase/migrations/*.sql; do
-            psql -v ON_ERROR_STOP=1 -d gold_erp_concurrency_test -q -f "$f"
+          set -uo pipefail
+          pass=0
+          fail=0
+          failed=""
+          for f in supabase/tests/*.test.sql; do
+            base="$(basename "$f" .test.sql)"
+            case "$base" in
+              *concurrency*|upgrade_*) continue ;;
+            esac
+            db="t_$(echo "$base" | tr -c 'a-zA-Z0-9' '_' | cut -c1-50)"
+            ok=1
+            echo "::group::$base"
+            if ! psql -v ON_ERROR_STOP=1 -d postgres -q -c "create database $db template gold_erp_template;"; then
+              echo "could not create database $db"
+              ok=0
+            fi
+            if [ "$ok" -eq 1 ]; then
+              if ! psql -v ON_ERROR_STOP=1 -d "$db" -f "$f"; then
+                ok=0
+              fi
+            fi
+            psql -d postgres -q -c "drop database if exists $db with (force);" >/dev/null 2>&1 || true
+            echo "::endgroup::"
+            if [ "$ok" -eq 1 ]; then
+              pass=$((pass + 1))
+              echo "PASS $base"
+            else
+              fail=$((fail + 1))
+              failed="$failed $base"
+              echo "FAIL $base"
+            fi
           done
-          psql -v ON_ERROR_STOP=1 -d gold_erp_concurrency_test -q -f supabase/seed.sql
-          psql -v ON_ERROR_STOP=1 -d gold_erp_concurrency_test -c 'create extension if not exists dblink;'
+          echo "--------------------------------------------------"
+          echo "regular SQL suites: $pass passed, $fail failed"
+          if [ "$fail" -ne 0 ]; then
+            echo "FAILED:$failed"
+            exit 1
+          fi
+          exit 0
 
-      - name: Phase 9 — inventory_core_phase9_concurrency.test.sql (two real sessions via dblink)
-        # dblink connects from the SERVER back to itself, so the conninfo is
-        # resolved inside the service container (127.0.0.1:5432 there), not
-        # from the runner. That is also this file's own default, passed
-        # explicitly so the dependency is visible rather than implied.
+      # ---------------------------------------------------------------------
+      # Concurrency suites — one clean clone each, plus dblink.
+      # ---------------------------------------------------------------------
+      # These open two genuinely independent server-side sessions through
+      # dblink and assert on real lock contention, so they must never share a
+      # database with anything else. dblink connects from the SERVER back to
+      # itself, so the conninfo resolves inside the service container
+      # (127.0.0.1:5432 there), not from the runner.
+      #
+      # POSTGRES_PASSWORD above is load-bearing for these: dblink refuses a
+      # connection opened by a NON-superuser (several of these files call
+      # dblink_connect after `set local role authenticated`) unless the
+      # connection actually authenticated with a password. A trust-auth server
+      # fails them with "password or GSSAPI delegated credentials required"
+      # even though a password was supplied.
+      - name: Run concurrency SQL suites (two real sessions via dblink)
+        # Same accounting rules as the regular step above. The cleanup DROP
+        # matters more here than anywhere else: these files open real dblink
+        # sessions against the very database being dropped, so a backend that
+        # has not finished exiting makes a plain DROP DATABASE fail with
+        # "database is being accessed by other users". Under the previous
+        # `set -e` that turned a fully passing run into a step failure right
+        # after the last PASS line. It is now `WITH (FORCE)` (PostgreSQL 13+,
+        # terminates leftover backends) and best-effort.
         run: |
-          psql -v ON_ERROR_STOP=1 -d gold_erp_concurrency_test \
-            -v "dblink_conninfo=host=127.0.0.1 port=5432 user=postgres password=postgres" \
-            -f supabase/tests/inventory_core_phase9_concurrency.test.sql
+          set -uo pipefail
+          pass=0
+          fail=0
+          failed=""
+          for f in supabase/tests/*concurrency*.test.sql; do
+            base="$(basename "$f" .test.sql)"
+            db="c_$(echo "$base" | tr -c 'a-zA-Z0-9' '_' | cut -c1-50)"
+            ok=1
+            echo "::group::$base"
+            if ! psql -v ON_ERROR_STOP=1 -d postgres -q -c "create database $db template gold_erp_template;"; then
+              echo "could not create database $db"
+              ok=0
+            fi
+            if [ "$ok" -eq 1 ]; then
+              if ! psql -v ON_ERROR_STOP=1 -d "$db" -q -c 'create extension if not exists dblink;'; then
+                echo "could not create dblink extension in $db"
+                ok=0
+              fi
+            fi
+            if [ "$ok" -eq 1 ]; then
+              if ! psql -v ON_ERROR_STOP=1 -d "$db" \
+                   -v "dblink_conninfo=host=127.0.0.1 port=5432 user=postgres password=postgres" \
+                   -f "$f"; then
+                ok=0
+              fi
+            fi
+            psql -d postgres -q -c "drop database if exists $db with (force);" >/dev/null 2>&1 || true
+            echo "::endgroup::"
+            if [ "$ok" -eq 1 ]; then
+              pass=$((pass + 1))
+              echo "PASS $base"
+            else
+              fail=$((fail + 1))
+              failed="$failed $base"
+              echo "FAIL $base"
+            fi
+          done
+          echo "--------------------------------------------------"
+          echo "concurrency SQL suites: $pass passed, $fail failed"
+          if [ "$fail" -ne 0 ]; then
+            echo "FAILED:$failed"
+            exit 1
+          fi
+          exit 0
 
       # ---------------------------------------------------------------------
-      # Database 3 — the production upgrade path (0226 + real seed, THEN
-      # 0227+ on top in a separate psql invocation). The script builds and
-      # drops this database itself.
+      # Upgrade suites — each script builds its OWN baseline.
       # ---------------------------------------------------------------------
-      - name: Phase 9 — upgrade test (scripts/run_upgrade_test_phase9_inventory.sh)
-        run: bash scripts/run_upgrade_test_phase9_inventory.sh
+      # These cannot use the template: each one deliberately builds a database
+      # up to a specific historical migration, applies the REAL seed.sql at
+      # that point, then applies the newer migrations on top in a separate
+      # psql invocation — reproducing what a production upgrade actually
+      # experiences. Each script drops/recreates the database named in its own
+      # DATABASE_URL, so each script gets a distinct database name.
+      - name: Run upgrade suites
+        # Same accounting rules as the two steps above. Note each script is
+        # itself `set -euo pipefail` internally and returns non-zero on
+        # failure, which is exactly what is checked here — including the
+        # deliberately negative runner, which returns non-zero only if the
+        # migration it expects to abort unexpectedly SUCCEEDS.
+        run: |
+          set -uo pipefail
+          pass=0
+          fail=0
+          failed=""
+          for s in scripts/run_upgrade_test*.sh; do
+            base="$(basename "$s" .sh)"
+            db="u_$(echo "$base" | tr -c 'a-zA-Z0-9' '_' | cut -c1-50)"
+            ok=1
+            echo "::group::$base"
+            if ! DATABASE_URL="postgresql://postgres:postgres@127.0.0.1:5432/$db" bash "$s"; then
+              ok=0
+            fi
+            psql -d postgres -q -c "drop database if exists $db with (force);" >/dev/null 2>&1 || true
+            echo "::endgroup::"
+            if [ "$ok" -eq 1 ]; then
+              pass=$((pass + 1))
+              echo "PASS $base"
+            else
+              fail=$((fail + 1))
+              failed="$failed $base"
+              echo "FAIL $base"
+            fi
+          done
+          echo "--------------------------------------------------"
+          echo "upgrade SQL suites: $pass passed, $fail failed"
+          if [ "$fail" -ne 0 ]; then
+            echo "FAILED:$failed"
+            exit 1
+          fi
+          exit 0

@@ -125,6 +125,42 @@ begin
 end;
 $$;
 
+-- ---------------------------------------------------------------------------
+-- Hotfix 9.1.0 — deterministic overlap proof.
+-- ---------------------------------------------------------------------------
+-- `dblink_is_busy()` only says "this connection has not returned a result
+-- yet". It cannot distinguish "the remote query is genuinely parked on a
+-- lock held by the other session" from "the remote query has not started
+-- yet" or "it is still doing ordinary work" — so a scenario that asserts two
+-- sessions actually CONTENDED could pass while they merely ran one after the
+-- other. That is exactly how scenario B below became intermittent
+-- (3 failures in 6 runs before this fix).
+--
+-- pg_blocking_pids(pid) answers the real question directly: it returns the
+-- backends whose locks are blocking `pid`. Waiting until the second session's
+-- backend is blocked BY THE FIRST SESSION'S BACKEND SPECIFICALLY proves both
+-- halves of the claim — the two transactions overlapped in time, and the
+-- second is parked behind the first's lock — before the first is released.
+--
+-- This is a bounded wait for a state that MUST occur, not a retry loop: if
+-- the state is never observed the function returns false and the caller's
+-- assert fails loudly. The operation under test is never re-attempted.
+create or replace function public._p7cc_wait_blocked_by(p_pid int, p_blocker int, p_max_polls int default 200, p_interval numeric default 0.05)
+returns boolean
+language plpgsql
+as $$
+declare v_i int;
+begin
+  for v_i in 1..p_max_polls loop
+    if p_blocker = any (pg_blocking_pids(p_pid)) then
+      return true;
+    end if;
+    perform pg_sleep(p_interval);
+  end loop;
+  return p_blocker = any (pg_blocking_pids(p_pid));
+end;
+$$;
+
 -- ============================================================================
 -- 0. Fixtures — own prefix 'a7100000-.../P7CC', committed immediately (each
 -- top-level statement here auto-commits — this file wraps nothing in an
@@ -415,7 +451,8 @@ end $$;
 -- ============================================================================
 do $$
 declare
-  v_busy boolean;
+  v_blocked boolean;
+  v_a_pid int; v_b_pid int;
   v_a_failed boolean := false; v_b_failed boolean := false;
   v_b_error text;
   v_claim_count integer;
@@ -427,33 +464,39 @@ begin
   perform dblink_connect('conn_a', current_setting('p7cc.dblink_conninfo') || ' dbname=' || current_database());
   perform dblink_connect('conn_b', current_setting('p7cc.dblink_conninfo') || ' dbname=' || current_database());
 
+  -- Each session's own backend pid — the handles the overlap proof below is
+  -- expressed in terms of.
+  select pid into v_a_pid from dblink('conn_a', 'select pg_backend_pid()') as t(pid int);
+  select pid into v_b_pid from dblink('conn_b', 'select pg_backend_pid()') as t(pid int);
+
   perform dblink_exec('conn_a', 'begin');
   perform dblink_exec('conn_a', 'set role authenticated');
   perform dblink_exec('conn_a', $sql$set request.jwt.claims = '{"sub":"a7100000-0000-4000-8000-000000000001","role":"authenticated"}'$sql$);
 
-  -- A finalizes batch_a, claiming order_a — sent async, held OPEN (no
-  -- commit yet) so B's concurrent attempt on the SAME source genuinely
-  -- overlaps rather than running sequentially.
-  perform dblink_send_query('conn_a', format(
-    $sql$select * from public.finalize_settlement_batch('%s'::uuid, 1, '%s'::jsonb, null, null, null)$sql$,
-    current_setting('p7cc.batch_a'), jsonb_build_array(jsonb_build_object('source_kind', 'sale', 'source_event_id', current_setting('p7cc.order_a')))::text
-  ));
-  perform public._p7cc_wait_ready('conn_a');
+  -- A finalizes batch_a, claiming order_a. Issued SYNCHRONOUSLY (dblink(),
+  -- not dblink_send_query()) on purpose: when this call returns, A's INSERT
+  -- into settlement_source_claims has provably executed. The old async
+  -- send + dblink_is_busy() poll could return before the remote query had
+  -- really run, which is what let B occasionally win the race and made this
+  -- scenario intermittent. A's TRANSACTION stays open either way — nothing
+  -- is committed until the explicit commit further down.
   begin
-    perform id from dblink_get_result('conn_a', true) as t(id uuid, settlement_number text, row_version bigint);
-    perform public._p7cc_drain_pending('conn_a');
+    perform id from dblink('conn_a', format(
+      $sql$select * from public.finalize_settlement_batch('%s'::uuid, 1, '%s'::jsonb, null, null, null)$sql$,
+      current_setting('p7cc.batch_a'), jsonb_build_array(jsonb_build_object('source_kind', 'sale', 'source_event_id', current_setting('p7cc.order_a')))::text
+    )) as t(id uuid, settlement_number text, row_version bigint);
   exception when others then
     v_a_failed := true;
+    raise notice 'A failed: %', sqlerrm;
   end;
-  -- A's finalize call has RUN (its INSERT into settlement_source_claims has
-  -- happened) but A's TRANSACTION is still open — nothing committed yet.
+  assert not v_a_failed, 'FAIL B: اعتماد A (الأول، بلا منافس) يجب أن ينجح — بدونه لا يوجد سباق أصلًا';
 
   -- B concurrently finalizes batch_b, selecting the SAME order_a. B's own
-  -- claim INSERT for the identical (source_kind, source_event_id) key
-  -- must genuinely block on A's still-uncommitted conflicting insert
-  -- (Postgres blocks a second inserter of a colliding unique key until the
-  -- first resolves) — sent async and polled, never a synchronous call that
-  -- would deadlock this script.
+  -- claim INSERT for the identical (source_kind, source_event_id) key must
+  -- genuinely block on A's still-uncommitted conflicting insert (Postgres
+  -- blocks a second inserter of a colliding unique key until the first
+  -- resolves) — sent async, because a synchronous call would park this
+  -- script itself.
   perform dblink_exec('conn_b', 'set role authenticated');
   perform dblink_exec('conn_b', $sql$set request.jwt.claims = '{"sub":"a7100000-0000-4000-8000-000000000001","role":"authenticated"}'$sql$);
   perform dblink_send_query('conn_b', format(
@@ -461,9 +504,17 @@ begin
     current_setting('p7cc.batch_b'), jsonb_build_array(jsonb_build_object('source_kind', 'sale', 'source_event_id', current_setting('p7cc.order_a')))::text
   ));
 
-  v_busy := public._p7cc_wait_busy('conn_b');
-  assert v_busy, 'FAIL B: محاولة الاعتماد الثانية (B) على نفس المصدر لم تُحجب رغم أن اعتماد A ما زال مفتوحًا ويحمل قفل المطالبة غير الملتزم';
+  -- THE overlap proof, and the reason this scenario is now deterministic:
+  -- B's backend must be observed WAITING ON A'S BACKEND SPECIFICALLY, while
+  -- A's transaction is still open. That single condition establishes both
+  -- that the two transactions overlapped in time and that B is parked behind
+  -- A's lock — neither of which dblink_is_busy() could ever show.
+  v_blocked := public._p7cc_wait_blocked_by(v_b_pid, v_a_pid);
+  assert v_blocked, format(
+    'FAIL B: محاولة الاعتماد الثانية (B، pid %s) لم تُرصد محجوبة على قفل جلسة A (pid %s) بينما معاملة A ما زالت مفتوحة — لم يحدث تداخل حقيقي، فالسيناريو لم يختبر شيئًا',
+    v_b_pid, v_a_pid);
 
+  -- Only now is A released. B was already parked behind it.
   perform dblink_exec('conn_a', 'commit');
   perform dblink_disconnect('conn_a');
 
@@ -477,8 +528,12 @@ begin
   end;
   perform dblink_disconnect('conn_b');
 
-  assert (v_a_failed or v_b_failed), 'FAIL B: إحدى محاولتي الاعتماد المتزامنتين على نفس المصدر يجب أن تُرفض';
-  assert not (v_a_failed and v_b_failed), 'FAIL B: إحدى محاولتي الاعتماد على الأقل يجب أن تنجح';
+  -- B was proven blocked by A before A committed, so B cannot have finished
+  -- first: once unblocked it must observe A's now-committed claim and be
+  -- rejected. Asserted directly on B (not the old "at least one of the two
+  -- failed"), which is strictly stronger and no longer satisfiable by A
+  -- having failed for some unrelated reason.
+  assert v_b_failed, 'FAIL B: محاولة الاعتماد الثانية (B) كان يجب أن تُرفض بعد التزام A — قُبلت بدلًا من ذلك، أي أن المصدر نفسه طُولب به مرتين';
 
   -- No double-counted claim — EXACTLY one active claim exists for order_a,
   -- and EXACTLY one settlement_batch_lines row was ever written for it,
@@ -1226,6 +1281,7 @@ end $$;
 drop function if exists public._p7cc_wait_busy(text, int, numeric);
 drop function if exists public._p7cc_wait_ready(text, int, numeric);
 drop function if exists public._p7cc_drain_pending(text);
+drop function if exists public._p7cc_wait_blocked_by(int, int, int, numeric);
 
 do $$ begin
   raise notice 'ALL settlements_phase7_concurrency.test.sql ASSERTIONS PASSED (A-K)';

@@ -10,12 +10,16 @@
 --       (0.00 effective sales profit [full return] + 10.00 net shipping +
 --       58.00 net adjustments), matching §81's "prove the formula, not an
 --       arbitrary number" spirit.
---   (B) August 2026 alone (contains business_today(), where every
---       reversal/cancellation in this fixture necessarily lands -- see the
---       fixture's own header comment): the July return/adjustment/
---       settlement-B reversals land here, NOT in July -- §85 Event Date
---       semantics proof.
---   (C) July+August COMBINED: every reversed/cancelled item's net
+--   (B) The REVERSAL MONTH alone -- i.e. the calendar month containing
+--       business_today(), which is where every reversal/cancellation in this
+--       fixture necessarily lands (the fixture passes business_today()
+--       explicitly to reverse_sales_return()/reverse_sales_return_refund_
+--       event()/reverse_sales_order_adjustment()/cancel_settlement_batch()).
+--       This window is COMPUTED, never hardcoded, so it stays correct as the
+--       real clock advances across months and years: the July return/
+--       adjustment/settlement-B reversals land here, NOT in July -- §85
+--       Event Date semantics proof.
+--   (C) July + the reversal month COMBINED: every reversed/cancelled item's net
 --       contribution collapses to exactly 0.00 (return, adjustment,
 --       settlement B) while the untouched settlement A and shipment remain
 --       fully intact -- proving no double-counting and no silent data loss
@@ -34,6 +38,43 @@
 begin;
 
 \i supabase/tests/fixtures/phase8_golden_scenario_fixture.sql
+
+-- ---------------------------------------------------------------------------
+-- Reversal window — derived, never hardcoded.
+-- ---------------------------------------------------------------------------
+-- The fixture's ORIGINAL events carry fixed July 2026 business dates, but
+-- every reversal/cancellation is pinned to `public.business_today()` at
+-- fixture-load time (see the fixture's reverse_sales_return() /
+-- reverse_sales_return_refund_event() / reverse_sales_order_adjustment() /
+-- cancel_settlement_batch() calls, all of which pass business_today()
+-- explicitly). This file used to assert those reversals landed in
+-- "August 2026", which was only ever true while the suite happened to be
+-- run during August 2026 — from September 2026 onward assertion B2 failed
+-- with `expected +555.00, got 0`, because the reversals had moved into the
+-- new current month while the assertion had not.
+--
+-- The reversal window is therefore computed here from business_today()
+-- itself, so it tracks the real clock forever, across both month AND year
+-- boundaries. Nothing is weakened: the SAME exact figures are asserted, just
+-- against the window the reversals genuinely belong to.
+do $$
+declare
+  v_today date := public.business_today();
+  v_original_month_start constant date := date '2026-07-01';
+begin
+  -- The whole §85 Event-Date proof rests on the reversals landing in a
+  -- DIFFERENT calendar month than the originals. If business_today() ever
+  -- shared July 2026 with them, sections A and B would silently overlap and
+  -- both could pass while proving nothing. Fail loudly instead of quietly
+  -- degrading into a meaningless test.
+  if date_trunc('month', v_today) <= date_trunc('month', v_original_month_start) then
+    raise exception 'FIXTURE PRECONDITION VIOLATED: business_today() = % must fall in a calendar month strictly AFTER the fixture''s original-event month (2026-07); the reversal-vs-original split this file proves cannot exist otherwise', v_today;
+  end if;
+
+  perform set_config('p8g.rev_start', date_trunc('month', v_today)::date::text, true);
+  perform set_config('p8g.rev_end', (date_trunc('month', v_today) + interval '1 month' - interval '1 day')::date::text, true);
+  perform set_config('p8g.rev_label', to_char(v_today, 'YYYY-MM'), true);
+end $$;
 
 set role authenticated;
 
@@ -78,45 +119,52 @@ begin
 end $$;
 
 -- ---------------------------------------------------------------------------
--- (B) August 2026 alone -- the reversal/undo events (§85).
+-- (B) The reversal month (the month containing business_today()) alone --
+--     the reversal/undo events (§85).
 -- ---------------------------------------------------------------------------
 do $$
 declare
   v jsonb;
+  v_from date := current_setting('p8g.rev_start')::date;
+  v_to date := current_setting('p8g.rev_end')::date;
 begin
   perform set_config('request.jwt.claims', json_build_object('sub', '80000000-0000-4000-8000-000000000001', 'role', 'authenticated')::text, true);
-  v := public.get_dashboard_summary('2026-08-01', '2026-08-31', null);
+  v := public.get_dashboard_summary(v_from, v_to, null);
 
   if v -> 'sales' ->> 'orders_count' <> '0' then
-    raise exception 'FAIL B1: expected August orders_count=0 (Sale was dated July), got %', v -> 'sales' ->> 'orders_count';
+    raise exception 'FAIL B1: expected reversal-month (%..%) orders_count=0 (Sale was dated July 2026), got %', v_from, v_to, v -> 'sales' ->> 'orders_count';
   end if;
   if v -> 'returns' ->> 'return_financial_impact' <> '555.00' then
-    raise exception 'FAIL B2 (CRITICAL): expected August return_financial_impact=+555.00 (the undo of July''s -555.00), got %', v -> 'returns' ->> 'return_financial_impact';
+    raise exception 'FAIL B2 (CRITICAL): expected reversal-month (%..%) return_financial_impact=+555.00 (the undo of July''s -555.00), got %', v_from, v_to, v -> 'returns' ->> 'return_financial_impact';
   end if;
   if v -> 'adjustments' ->> 'net_adjustments_result' <> '-58.00' then
-    raise exception 'FAIL B3 (CRITICAL): expected August net_adjustments_result=-58.00 (the undo of July''s +58.00), got %', v -> 'adjustments' ->> 'net_adjustments_result';
+    raise exception 'FAIL B3 (CRITICAL): expected reversal-month (%..%) net_adjustments_result=-58.00 (the undo of July''s +58.00), got %', v_from, v_to, v -> 'adjustments' ->> 'net_adjustments_result';
   end if;
   if v -> 'settlements' ->> 'expected' <> '-88.00' then
-    raise exception 'FAIL B4 (CRITICAL): expected August settlements expected=-88.00 (batch B''s cancellation undo), got %', v -> 'settlements' ->> 'expected';
+    raise exception 'FAIL B4 (CRITICAL): expected reversal-month (%..%) settlements expected=-88.00 (batch B''s cancellation undo), got %', v_from, v_to, v -> 'settlements' ->> 'expected';
   end if;
   if v -> 'settlements' ->> 'actual' <> '3425.00' then
-    raise exception 'FAIL B5: expected August settlements actual=3425.00 (batch A''s bank movement, dated today), got %', v -> 'settlements' ->> 'actual';
+    raise exception 'FAIL B5: expected reversal-month (%..%) settlements actual=3425.00 (batch A''s bank movement, dated today), got %', v_from, v_to, v -> 'settlements' ->> 'actual';
   end if;
   if v -> 'net_operating_return' ->> 'net_operating_return' <> '497.00' then
-    raise exception 'FAIL B6 (CRITICAL): expected August Net Operating Return=497.00 (555.00 + 0 + -58.00), got %', v -> 'net_operating_return' ->> 'net_operating_return';
+    raise exception 'FAIL B6 (CRITICAL): expected reversal-month (%..%) Net Operating Return=497.00 (555.00 + 0 + -58.00), got %', v_from, v_to, v -> 'net_operating_return' ->> 'net_operating_return';
   end if;
-  raise notice 'PASS B: August 2026 correctly carries every reversal/cancellation undo dated by its OWN business date (§85), never July''s';
+  raise notice 'PASS B: the reversal month (%..%) correctly carries every reversal/cancellation undo dated by its OWN business date (§85), never July''s', v_from, v_to;
 end $$;
 
 -- ---------------------------------------------------------------------------
--- (C) July+August combined -- everything reversed nets to exactly zero.
+-- (C) July + the reversal month combined -- everything reversed nets to
+--     exactly zero.
 -- ---------------------------------------------------------------------------
 do $$
 declare
   v jsonb;
+  v_to date := current_setting('p8g.rev_end')::date;
 begin
   perform set_config('request.jwt.claims', json_build_object('sub', '80000000-0000-4000-8000-000000000001', 'role', 'authenticated')::text, true);
-  v := public.get_dashboard_summary('2026-07-01', '2026-08-31', null);
+  -- Spans from the originals' month through the end of the reversal month,
+  -- however many empty months sit between them.
+  v := public.get_dashboard_summary('2026-07-01', v_to, null);
 
   if v -> 'sales' ->> 'effective_net_sales_profit' <> '555.00' then
     raise exception 'FAIL C1: expected combined effective_net_sales_profit=555.00 (return fully undone), got %', v -> 'sales' ->> 'effective_net_sales_profit';
@@ -136,7 +184,7 @@ begin
   if v -> 'net_operating_return' ->> 'net_operating_return' <> '565.00' then
     raise exception 'FAIL C6 (CRITICAL): expected combined Net Operating Return=565.00 (555.00 + 10.00 + 0.00), got %', v -> 'net_operating_return' ->> 'net_operating_return';
   end if;
-  raise notice 'PASS C: combined July+August nets every reversal to exactly 0.00 with no double-counting -- the untouched Sale/Shipment/Batch-A remain fully intact';
+  raise notice 'PASS C: combined 2026-07-01..% nets every reversal to exactly 0.00 with no double-counting -- the untouched Sale/Shipment/Batch-A remain fully intact', v_to;
 end $$;
 
 -- ---------------------------------------------------------------------------
@@ -147,24 +195,52 @@ do $$
 declare
   v jsonb;
   v_jul jsonb;
-  v_aug jsonb;
+  v_rev jsonb;
+  v_rev_label text := current_setting('p8g.rev_label');
+  v_to date := current_setting('p8g.rev_end')::date;
+  v_stray text;
 begin
   perform set_config('request.jwt.claims', json_build_object('sub', '80000000-0000-4000-8000-000000000001', 'role', 'authenticated')::text, true);
-  v := public.get_dashboard_trends('2026-07-01', '2026-08-31', null, 'month');
+  v := public.get_dashboard_trends('2026-07-01', v_to, null, 'month');
 
   select b into v_jul from jsonb_array_elements(v -> 'buckets') b where b ->> 'bucket_label' = '2026-07';
-  select b into v_aug from jsonb_array_elements(v -> 'buckets') b where b ->> 'bucket_label' = '2026-08';
+  select b into v_rev from jsonb_array_elements(v -> 'buckets') b where b ->> 'bucket_label' = v_rev_label;
 
+  if v_jul is null or v_rev is null then
+    raise exception 'FAIL D0: expected month buckets for 2026-07 and % to both exist, got labels: %',
+      v_rev_label, (select jsonb_agg(b ->> 'bucket_label') from jsonb_array_elements(v -> 'buckets') b);
+  end if;
   if v_jul ->> 'net_operating_return' <> '68.00' then
     raise exception 'FAIL D1 (CRITICAL Single Reporting Engine): trend July net_operating_return expected 68.00, got %', v_jul ->> 'net_operating_return';
   end if;
-  if v_aug ->> 'net_operating_return' <> '497.00' then
-    raise exception 'FAIL D2 (CRITICAL Single Reporting Engine): trend August net_operating_return expected 497.00, got %', v_aug ->> 'net_operating_return';
+  if v_rev ->> 'net_operating_return' <> '497.00' then
+    raise exception 'FAIL D2 (CRITICAL Single Reporting Engine): trend reversal-month (%) net_operating_return expected 497.00, got %', v_rev_label, v_rev ->> 'net_operating_return';
   end if;
-  if v_jul ->> 'effective_net_sales_profit' <> '0.00' or v_aug ->> 'effective_net_sales_profit' <> '555.00' then
-    raise exception 'FAIL D3: trend effective_net_sales_profit mismatch -- July=%, August=%', v_jul ->> 'effective_net_sales_profit', v_aug ->> 'effective_net_sales_profit';
+  if v_jul ->> 'effective_net_sales_profit' <> '0.00' or v_rev ->> 'effective_net_sales_profit' <> '555.00' then
+    raise exception 'FAIL D3: trend effective_net_sales_profit mismatch -- July=%, %=%', v_jul ->> 'effective_net_sales_profit', v_rev_label, v_rev ->> 'effective_net_sales_profit';
   end if;
-  raise notice 'PASS D: get_dashboard_trends() reproduces get_dashboard_summary()''s exact figures for the same ranges (Screen total = Trend point)';
+
+  -- Every month BETWEEN the originals and the reversals must be genuinely
+  -- empty. Under the old hardcoded July/August range no such month could
+  -- exist, so this case went unproven; now that the window stretches to
+  -- whatever month "today" falls in, it is a real assertion that no event
+  -- leaked into an intervening month.
+  -- Compared NUMERICALLY, not as text: a zero-filled bucket renders its
+  -- net_operating_return as "0" (no scale), while a populated one renders
+  -- "68.00"/"497.00". Testing `<> '0.00'` would therefore flag a genuinely
+  -- empty month as a failure. The numeric comparison is exactly as strict --
+  -- any non-zero value in an intervening month still fails.
+  select string_agg(format('%s=%s', b ->> 'bucket_label', b ->> 'net_operating_return'), ', ')
+    into v_stray
+  from jsonb_array_elements(v -> 'buckets') b
+  where b ->> 'bucket_label' not in ('2026-07', v_rev_label)
+    and (b ->> 'net_operating_return')::numeric <> 0;
+
+  if v_stray is not null then
+    raise exception 'FAIL D4 (CRITICAL §85): months between the original events and their reversals must be exactly 0.00, got %', v_stray;
+  end if;
+
+  raise notice 'PASS D: get_dashboard_trends() reproduces get_dashboard_summary()''s exact figures for the same ranges (Screen total = Trend point), and every intervening month is exactly 0.00';
 end $$;
 
 -- ---------------------------------------------------------------------------

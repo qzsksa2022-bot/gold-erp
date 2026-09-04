@@ -84,6 +84,31 @@ insert into public.user_roles (user_id, role_id) values
   ('80000000-0000-4000-8000-000000000004', '80100000-0000-4000-8000-000000000098')
 on conflict do nothing;
 
+-- ---------------------------------------------------------------------------
+-- Reversal window — derived, never hardcoded.
+-- ---------------------------------------------------------------------------
+-- The fixture's ORIGINAL events carry fixed July 2026 business dates, but
+-- every reversal/cancellation is pinned to `public.business_today()` at
+-- fixture-load time. Asserting they land in "August 2026" was only true
+-- while the suite happened to run during August 2026; from September 2026
+-- onward those assertions failed against a window the reversals had already
+-- moved out of. The window is computed from business_today() here so it
+-- tracks the real clock forever, across month AND year boundaries. The same
+-- exact figures are asserted — only the window follows reality.
+do $$
+declare
+  v_today date := public.business_today();
+  v_original_month_start constant date := date '2026-07-01';
+begin
+  if date_trunc('month', v_today) <= date_trunc('month', v_original_month_start) then
+    raise exception 'FIXTURE PRECONDITION VIOLATED: business_today() = % must fall in a calendar month strictly AFTER the fixture''s original-event month (2026-07); the reversal-vs-original split this file proves cannot exist otherwise', v_today;
+  end if;
+
+  perform set_config('p8g.rev_start', date_trunc('month', v_today)::date::text, true);
+  perform set_config('p8g.rev_end', (date_trunc('month', v_today) + interval '1 month' - interval '1 day')::date::text, true);
+  perform set_config('p8g.rev_year', extract(year from v_today)::text, true);
+end $$;
+
 set role authenticated;
 
 -- ---------------------------------------------------------------------------
@@ -148,6 +173,8 @@ end $$;
 do $$
 declare
   v jsonb;
+  v_rev_start date := current_setting('p8g.rev_start')::date;
+  v_rev_end date := current_setting('p8g.rev_end')::date;
 begin
   perform set_config('request.jwt.claims', json_build_object('sub', '80000000-0000-4000-8000-000000000001', 'role', 'authenticated')::text, true);
 
@@ -156,22 +183,22 @@ begin
     raise exception 'FAIL B1: expected July net_profit_effect=-555.00/approved=1/reversed=0, got %', v -> 'summary';
   end if;
 
-  v := public.get_returns_report('2026-08-01', '2026-08-31');
+  v := public.get_returns_report(v_rev_start, v_rev_end);
   if v -> 'summary' ->> 'net_profit_effect' <> '555.00' or v -> 'summary' ->> 'approved_count' <> '0' or v -> 'summary' ->> 'reversed_count' <> '1' then
-    raise exception 'FAIL B2 (CRITICAL): expected August net_profit_effect=+555.00 (undo)/approved=0/reversed=1, got %', v -> 'summary';
+    raise exception 'FAIL B2 (CRITICAL): expected reversal-month (%..%) net_profit_effect=+555.00 (undo)/approved=0/reversed=1, got %', v_rev_start, v_rev_end, v -> 'summary';
   end if;
 
-  v := public.get_returns_report('2026-07-01', '2026-08-31');
+  v := public.get_returns_report('2026-07-01', v_rev_end);
   if v -> 'summary' ->> 'movements_count' <> '2'
      or v -> 'summary' ->> 'net_profit_effect' <> '0.00'
      or v -> 'summary' ->> 'revenue_effect' <> '0.00'
      or v -> 'summary' ->> 'gross_profit_effect' <> '0.00'
      or v -> 'summary' ->> 'payment_fee_effect' <> '0.00'
      or v -> 'summary' ->> 'refund_effect' <> '0.00' then
-    raise exception 'FAIL B3 (CRITICAL): expected combined July+Aug returns to net EXACTLY 0.00 across every field, got %', v -> 'summary';
+    raise exception 'FAIL B3 (CRITICAL): expected combined 2026-07-01..% returns to net EXACTLY 0.00 across every field, got %', v_rev_end, v -> 'summary';
   end if;
 
-  raise notice 'PASS B: get_returns_report() movements ledger reconciles -- July -555.00, August +555.00, combined = 0.00 (no double-counting)';
+  raise notice 'PASS B: get_returns_report() movements ledger reconciles -- July -555.00, reversal month (%..%) +555.00, combined = 0.00 (no double-counting)', v_rev_start, v_rev_end;
 end $$;
 
 -- ---------------------------------------------------------------------------
@@ -180,6 +207,8 @@ end $$;
 do $$
 declare
   v jsonb;
+  v_rev_start date := current_setting('p8g.rev_start')::date;
+  v_rev_end date := current_setting('p8g.rev_end')::date;
 begin
   perform set_config('request.jwt.claims', json_build_object('sub', '80000000-0000-4000-8000-000000000001', 'role', 'authenticated')::text, true);
 
@@ -188,19 +217,19 @@ begin
     raise exception 'FAIL C1: expected July net_profit_effect=58.00/approved_count=1, got %', v -> 'summary';
   end if;
 
-  v := public.get_adjustments_report('2026-08-01', '2026-08-31');
+  v := public.get_adjustments_report(v_rev_start, v_rev_end);
   if v -> 'summary' ->> 'net_profit_effect' <> '-58.00' or v -> 'summary' ->> 'reversed_count' <> '1' then
-    raise exception 'FAIL C2 (CRITICAL): expected August net_profit_effect=-58.00 (undo)/reversed_count=1, got %', v -> 'summary';
+    raise exception 'FAIL C2 (CRITICAL): expected reversal-month (%..%) net_profit_effect=-58.00 (undo)/reversed_count=1, got %', v_rev_start, v_rev_end, v -> 'summary';
   end if;
 
-  v := public.get_adjustments_report('2026-07-01', '2026-08-31');
+  v := public.get_adjustments_report('2026-07-01', v_rev_end);
   if v -> 'summary' ->> 'net_profit_effect' <> '0.00'
      or v -> 'summary' ->> 'gross_profit_effect' <> '0.00'
      or v -> 'summary' ->> 'customer_charge_effect' <> '0.00' then
-    raise exception 'FAIL C3 (CRITICAL): expected combined July+Aug adjustments to net EXACTLY 0.00 (net/gross profit, customer charge), got %', v -> 'summary';
+    raise exception 'FAIL C3 (CRITICAL): expected combined 2026-07-01..% adjustments to net EXACTLY 0.00 (net/gross profit, customer charge), got %', v_rev_end, v -> 'summary';
   end if;
 
-  raise notice 'PASS C: get_adjustments_report() movements ledger reconciles -- July +58.00, August -58.00, combined = 0.00 (no double-counting)';
+  raise notice 'PASS C: get_adjustments_report() movements ledger reconciles -- July +58.00, reversal month (%..%) -58.00, combined = 0.00 (no double-counting)', v_rev_start, v_rev_end;
 end $$;
 
 -- ---------------------------------------------------------------------------
@@ -238,6 +267,8 @@ do $$
 declare
   v jsonb;
   v_dash jsonb;
+  v_rev_start date := current_setting('p8g.rev_start')::date;
+  v_rev_end date := current_setting('p8g.rev_end')::date;
 begin
   perform set_config('request.jwt.claims', json_build_object('sub', '80000000-0000-4000-8000-000000000001', 'role', 'authenticated')::text, true);
 
@@ -260,13 +291,13 @@ begin
       v ->> 'row_basis', v ->> 'summary_basis';
   end if;
 
-  v := public.get_settlements_report('2026-08-01', '2026-08-31');
-  v_dash := public.get_dashboard_summary('2026-08-01', '2026-08-31') -> 'settlements';
+  v := public.get_settlements_report(v_rev_start, v_rev_end);
+  v_dash := public.get_dashboard_summary(v_rev_start, v_rev_end) -> 'settlements';
   if v -> 'summary' ->> 'expected' <> (v_dash ->> 'expected') or v -> 'summary' ->> 'actual' <> (v_dash ->> 'actual') then
-    raise exception 'FAIL E4 (CRITICAL, §39/§80): get_settlements_report() August summary must byte-match get_dashboard_summary() -- report=%, dashboard=%', v -> 'summary', v_dash;
+    raise exception 'FAIL E4 (CRITICAL, §39/§80): get_settlements_report() reversal-month (%..%) summary must byte-match get_dashboard_summary() -- report=%, dashboard=%', v_rev_start, v_rev_end, v -> 'summary', v_dash;
   end if;
 
-  raise notice 'PASS E: get_settlements_report() dual-basis figures byte-match get_dashboard_summary() for both July and August (§39/§80)';
+  raise notice 'PASS E: get_settlements_report() dual-basis figures byte-match get_dashboard_summary() for both July and the reversal month (%..%) (§39/§80)', v_rev_start, v_rev_end;
 end $$;
 
 -- ---------------------------------------------------------------------------
@@ -276,6 +307,7 @@ end $$;
 do $$
 declare
   v jsonb;
+  v_rev_year int := current_setting('p8g.rev_year')::int;
 begin
   perform set_config('request.jwt.claims', json_build_object('sub', '80000000-0000-4000-8000-000000000001', 'role', 'authenticated')::text, true);
 
@@ -296,13 +328,40 @@ begin
       v -> 'net_operating_return' ->> 'net_operating_return';
   end if;
 
+  -- Yearly: which figure 2026 must show depends on whether the reversals
+  -- landed in 2026 too. Both branches are exact -- neither is a relaxation.
+  --   * reversals in 2026  -> 2026 contains originals AND reversals, so the
+  --     whole scenario nets to 565.00 within the single year.
+  --   * reversals in a LATER year -> 2026 holds the originals ONLY (68.00,
+  --     byte-identical to the monthly July figure asserted just above), and
+  --     the reversal year holds the undo events ONLY (497.00, byte-identical
+  --     to assertion B in reports_dashboard_golden_scenario.test.sql). The
+  --     two still sum to 565.00, just across two yearly reports instead of
+  --     one -- which is a STRICTER statement than the old single assertion.
   v := public.get_yearly_management_report(2026);
-  if v ->> 'report_type' <> 'yearly' or v ->> 'year_start' <> '2026-01-01' or v ->> 'year_end' <> '2026-12-31' or v -> 'net_operating_return' ->> 'net_operating_return' <> '565.00' then
-    raise exception 'FAIL F4 (CRITICAL, §39): expected yearly 2026 NOR=565.00 (the full combined July+August scenario -- no double-counting across the whole year), got %',
-      v -> 'net_operating_return' ->> 'net_operating_return';
+  if v ->> 'report_type' <> 'yearly' or v ->> 'year_start' <> '2026-01-01' or v ->> 'year_end' <> '2026-12-31' then
+    raise exception 'FAIL F4a: expected yearly 2026 report_type=yearly/year_start=2026-01-01/year_end=2026-12-31, got %', v;
   end if;
 
-  raise notice 'PASS F: Daily/Weekly/Monthly/Yearly Management Reports delegate correctly -- NOR daily=-555.00, weekly=10.00, monthly=68.00, yearly=565.00';
+  if v_rev_year = 2026 then
+    if v -> 'net_operating_return' ->> 'net_operating_return' <> '565.00' then
+      raise exception 'FAIL F4 (CRITICAL, §39): reversals landed in 2026, so yearly 2026 NOR must be 565.00 (the full combined scenario -- no double-counting across the whole year), got %',
+        v -> 'net_operating_return' ->> 'net_operating_return';
+    end if;
+  else
+    if v -> 'net_operating_return' ->> 'net_operating_return' <> '68.00' then
+      raise exception 'FAIL F4b (CRITICAL, §39): reversals landed in % (not 2026), so yearly 2026 must carry the ORIGINAL events only, NOR=68.00, got %',
+        v_rev_year, v -> 'net_operating_return' ->> 'net_operating_return';
+    end if;
+
+    v := public.get_yearly_management_report(v_rev_year);
+    if v -> 'net_operating_return' ->> 'net_operating_return' <> '497.00' then
+      raise exception 'FAIL F4c (CRITICAL, §39/§85): yearly % must carry the REVERSAL events only, NOR=497.00, got %',
+        v_rev_year, v -> 'net_operating_return' ->> 'net_operating_return';
+    end if;
+  end if;
+
+  raise notice 'PASS F: Daily/Weekly/Monthly/Yearly Management Reports delegate correctly -- NOR daily=-555.00, weekly=10.00, monthly=68.00, yearly split proven for reversal year %', v_rev_year;
 end $$;
 
 -- ---------------------------------------------------------------------------

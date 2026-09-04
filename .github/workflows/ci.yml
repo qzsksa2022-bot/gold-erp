@@ -88,6 +88,42 @@ jobs:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: postgres
+          # --------------------------------------------------------------
+          # Why both of these are required, and why the default is wrong.
+          # --------------------------------------------------------------
+          # The concurrency suites open dblink sessions from the SERVER back
+          # to itself at 127.0.0.1, after `set local role authenticated`.
+          # dblink refuses a connection opened by a non-superuser unless that
+          # connection actually AUTHENTICATED WITH A PASSWORD, so those two
+          # files failed with:
+          #   password or GSSAPI delegated credentials required
+          #   Non-superusers may only connect using credentials they provide
+          #
+          # Nothing here ever set POSTGRES_HOST_AUTH_METHOD=trust. The trust
+          # came from initdb itself: its default --auth-host is `trust`, so
+          # the generated pg_hba.conf begins with
+          #     host all all 127.0.0.1/32 trust
+          #     host all all ::1/128      trust
+          # and the official entrypoint only APPENDS its own
+          #     host all all all <POSTGRES_HOST_AUTH_METHOD>
+          # at the end. pg_hba.conf is FIRST-MATCH-WINS, so the container's
+          # own loopback — precisely the address dblink dials — matched the
+          # trust line and never consumed the password.
+          #
+          # This is also why nothing else in this job ever noticed: psql runs
+          # on the RUNNER, so its packets arrive from the docker bridge
+          # address, not 127.0.0.1, and matched the appended scram rule.
+          #
+          # POSTGRES_INITDB_ARGS is the part that actually fixes it — it makes
+          # initdb write the loopback rules as scram-sha-256 in the first
+          # place. `local` (unix socket) is deliberately left at trust: the
+          # image's own entrypoint initialises the cluster over the socket
+          # with --no-password, and forcing a password there breaks startup.
+          # POSTGRES_HOST_AUTH_METHOD is set explicitly so the appended
+          # catch-all rule is pinned too, rather than relying on the image's
+          # default staying scram-sha-256.
+          POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+          POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
         ports:
           - 5432:5432
         options: >-
@@ -163,6 +199,76 @@ jobs:
           # the image ever stops shipping contrib.
           psql -v ON_ERROR_STOP=1 -d postgres -tAc \
             "select 1 from pg_available_extensions where name = 'dblink';" | grep -q 1
+
+      # Runs BEFORE the (expensive) template build, so a mis-provisioned
+      # server fails the job in seconds with an unambiguous message rather
+      # than surfacing much later as a confusing dblink error inside two
+      # specific concurrency suites.
+      - name: Verify host authentication really uses a password (not trust)
+        run: |
+          set -uo pipefail
+
+          echo "1) the correct password over TCP must be ACCEPTED"
+          if ! PGPASSWORD=postgres psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -tAc 'select 1' >/dev/null; then
+            echo "FAILED: could not connect with the correct password."
+            exit 1
+          fi
+          echo "   ok"
+
+          echo "2) a wrong password over TCP must be REJECTED"
+          if PGPASSWORD=deliberately-wrong-password psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -tAc 'select 1' >/dev/null 2>&1; then
+            echo "FAILED: the server ACCEPTED a wrong password over TCP — host auth is trust, not password-based."
+            echo "        dblink would then refuse every non-superuser connection the concurrency suites make."
+            exit 1
+          fi
+          echo "   ok (rejected)"
+
+          # Checks 1 and 2 run from the RUNNER, whose packets arrive from the
+          # docker bridge address — they can never match the 127.0.0.1/32
+          # rule that dblink actually uses. This check reads the server's own
+          # parsed rule table, which covers the loopback path directly.
+          echo "3) no host rule may still use trust (this is the loopback path dblink dials)"
+          trust_rules="$(PGPASSWORD=postgres psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -tAc \
+            "select count(*) from pg_hba_file_rules where type like 'host%' and auth_method = 'trust';")"
+          if [ "$trust_rules" != "0" ]; then
+            echo "FAILED: $trust_rules host rule(s) still use trust:"
+            PGPASSWORD=postgres psql -h 127.0.0.1 -p 5432 -U postgres -d postgres \
+              -c "select line_number, type, database, user_name, address, auth_method from pg_hba_file_rules order by line_number;"
+            exit 1
+          fi
+          echo "   ok (0 trust host rules)"
+
+          echo "4) a NON-superuser dblink connection over the container's own loopback must work — the exact path the concurrency suites use"
+          PGPASSWORD=postgres psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -p 5432 -U postgres -d postgres -q -c "
+            create extension if not exists dblink;
+            create role dblink_auth_probe nologin;
+            do \$\$
+            declare v int;
+            begin
+              -- Mirrors the suites exactly: a non-superuser calling dblink.
+              set local role dblink_auth_probe;
+              perform dblink_connect('probe', 'host=127.0.0.1 port=5432 user=postgres password=postgres dbname=postgres');
+              select x into v from dblink('probe', 'select 1') as t(x int);
+              perform dblink_disconnect('probe');
+              if v is distinct from 1 then
+                raise exception 'dblink probe returned %, expected 1', v;
+              end if;
+            end \$\$;
+            -- psql -c sends these as ONE implicit transaction, so the DO
+            -- block's \`set local role\` is still in effect here. Without this
+            -- reset, the DROP below runs as the (non-superuser) probe role
+            -- and fails with 'permission denied to drop role'.
+            reset role;
+            drop role dblink_auth_probe;
+          "
+          if [ $? -ne 0 ]; then
+            echo "FAILED: a non-superuser dblink connection over 127.0.0.1 did not succeed."
+            exit 1
+          fi
+          echo "   ok"
+
+          echo "host authentication verified: passwords are genuinely required."
+          exit 0
 
       - name: Create Supabase roles (cluster-wide)
         # These exact role names are what every RLS policy and GRANT in

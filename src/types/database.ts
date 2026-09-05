@@ -3900,6 +3900,61 @@ export interface Database {
           total_count: number;
         }[];
       };
+      // ---------------------------------------------------------------
+      // Phase 10 — Store Expenses Core (0233-0236). The two base tables are
+      // deliberately NOT declared under `Tables` above: access is exclusively
+      // through these RPCs (Layer-A lockdown, 0234). Every monetary value is
+      // TEXT, never a raw numeric.
+      // ---------------------------------------------------------------
+      create_expense_category: {
+        Args: { p_code: string; p_name_ar: string; p_name_en?: string | null; p_notes?: string | null };
+        Returns: { id: string; code: string; row_version: number }[];
+      };
+      update_expense_category: {
+        Args: { p_id: string; p_expected_version: number; p_name_ar: string; p_name_en?: string | null; p_notes?: string | null };
+        Returns: { id: string; row_version: number }[];
+      };
+      enable_expense_category: { Args: { p_id: string }; Returns: undefined };
+      disable_expense_category: { Args: { p_id: string }; Returns: undefined };
+      record_store_expense: {
+        Args: {
+          p_store_id: string;
+          p_expense_category_id: string;
+          p_amount: string;
+          p_business_date?: string;
+          p_description?: string | null;
+          p_closed_day_reason?: string | null;
+        };
+        Returns: { id: string; expense_number: string; amount: string }[];
+      };
+      reverse_store_expense: {
+        Args: { p_expense_id: string; p_reason: string; p_reversal_business_date?: string; p_closed_day_reason?: string | null };
+        Returns: { id: string; expense_number: string; amount: string }[];
+      };
+      list_expense_categories: {
+        Args: { p_search?: string | null; p_status?: string | null; p_limit?: number; p_offset?: number };
+        Returns: Json;
+      };
+      list_store_expenses: {
+        Args: {
+          p_date_from: string;
+          p_date_to: string;
+          p_store_ids?: string[] | null;
+          p_expense_category_id?: string | null;
+          p_entry_kind?: string | null;
+          p_search?: string | null;
+          p_limit?: number;
+          p_offset?: number;
+        };
+        Returns: Json;
+      };
+      // Phase 10 — the expense-aware Dashboard wrapper. Calls
+      // get_dashboard_summary_with_comparison() and only ADDS to its result;
+      // `net_operating_return` keeps its exact legacy value.
+      get_dashboard_summary_with_expenses: {
+        Args: { p_date_from: string; p_date_to: string; p_period_preset?: string | null; p_store_ids?: string[] | null };
+        Returns: Json;
+      };
       inventory_operable_store_lookups: { Args: Record<string, never>; Returns: { id: string; name_ar: string }[] };
       inventory_visible_store_lookups: { Args: Record<string, never>; Returns: { id: string; name_ar: string }[] };
       inventory_active_item_lookups: { Args: Record<string, never>; Returns: { id: string; sku: string; name_ar: string }[] };

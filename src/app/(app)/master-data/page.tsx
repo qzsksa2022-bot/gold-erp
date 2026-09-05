@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { Gem, Hammer, FolderTree, CreditCard, Landmark, Truck, Wrench, Route, ChevronLeft } from "lucide-react";
+import { Gem, Hammer, FolderTree, CreditCard, Landmark, Truck, Wrench, Route, Tags, ChevronLeft } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { requireAnyPermission } from "@/lib/permissions/guard";
 import { sessionHasPermission } from "@/lib/permissions/session";
@@ -56,6 +56,13 @@ const SECTIONS: { title: string; description: string; href: string; icon: Lucide
     href: ROUTES.masterDataAdjustmentTypes,
     icon: Wrench,
     permission: "adjustments.manage_types",
+  },
+  {
+    title: "تصنيفات المصروفات",
+    description: "أنواع المصروفات التشغيلية القابلة للاختيار عند تسجيل مصروف لفرع.",
+    href: ROUTES.expenseCategories,
+    icon: Tags,
+    permission: "expenses.view",
   },
   {
     title: "مسارات التسوية",

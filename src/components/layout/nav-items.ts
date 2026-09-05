@@ -14,6 +14,7 @@ import {
   Settings,
   LibraryBig,
   Boxes,
+  Receipt,
 } from "lucide-react";
 import type { PermissionKey } from "@/lib/permissions/constants";
 import { ROUTES } from "@/lib/constants";
@@ -43,6 +44,7 @@ export const NAV_ITEMS: NavItem[] = [
   { label: "التعديلات والخدمات", href: ROUTES.adjustments, icon: Wrench, permission: "adjustments.view" },
   { label: "التسويات", href: ROUTES.settlements, icon: HandCoins, permission: "settlements.view" },
   { label: "المخزون", href: ROUTES.inventory, icon: Boxes, permission: "inventory.view" },
+  { label: "المصروفات", href: ROUTES.expenses, icon: Receipt, permission: "expenses.view" },
   { label: "التقارير", href: ROUTES.reports, icon: FileBarChart2, permission: "reports.view" },
   { label: "أسعار الذهب", href: ROUTES.goldPrices, icon: Coins, permission: "gold_prices.view" },
   {

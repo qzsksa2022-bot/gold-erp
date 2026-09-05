@@ -39,6 +39,9 @@ export const ROUTES = {
   inventory: "/inventory",
   inventoryItems: "/inventory/items",
   inventoryMovements: "/inventory/movements",
+  // Phase 10 — Store Expenses Core.
+  expenses: "/expenses",
+  expenseCategories: "/master-data/expense-categories",
   reports: "/reports",
   // Phase 8 — Reports, Dashboard & Exports (§21-§37, migrations 0201-0204).
   reportsSales: "/reports/sales",

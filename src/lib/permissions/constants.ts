@@ -102,6 +102,13 @@ export const PERMISSION_KEYS = [
   "inventory.receive",
   "inventory.adjust",
 
+  // Phase 10 (Store Expenses Core, migration 0233)
+  "expenses.view",
+  "expenses.create",
+  "expenses.reverse",
+  "expenses.manage_categories",
+  "expenses.process_closed_day",
+
   "audit_logs.view",
 
   "settings.manage",

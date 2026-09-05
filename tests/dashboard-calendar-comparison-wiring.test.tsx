@@ -111,7 +111,12 @@ const TRENDS_ENVELOPE = { granularity: "day", date_from: "2026-08-01", date_to: 
 function rpcRouter() {
   return vi.fn(async (name: string) => {
     switch (name) {
-      case "get_dashboard_summary_with_comparison":
+      // Phase 10: the page now reaches the calendar-aware wrapper THROUGH
+      // get_dashboard_summary_with_expenses() (0236), which calls
+      // get_dashboard_summary_with_comparison() server-side and only adds the
+      // expenses section. The preset contract asserted below is unchanged —
+      // it is forwarded verbatim through the new wrapper.
+      case "get_dashboard_summary_with_expenses":
         return { data: SUMMARY_ENVELOPE, error: null };
       case "get_dashboard_trends":
         return { data: TRENDS_ENVELOPE, error: null };
@@ -123,10 +128,10 @@ function rpcRouter() {
   });
 }
 
-/** The single `get_dashboard_summary_with_comparison` call's argument object. */
+/** The single calendar-aware summary call's argument object (Phase 10: reached via get_dashboard_summary_with_expenses). */
 function comparisonCallArgs() {
-  const call = rpcMock.mock.calls.find((c) => c[0] === "get_dashboard_summary_with_comparison");
-  expect(call, "the Dashboard never called get_dashboard_summary_with_comparison").toBeDefined();
+  const call = rpcMock.mock.calls.find((c) => c[0] === "get_dashboard_summary_with_expenses");
+  expect(call, "the Dashboard never called get_dashboard_summary_with_expenses").toBeDefined();
   return call![1] as Record<string, unknown>;
 }
 
@@ -145,12 +150,18 @@ beforeEach(() => {
 });
 
 describe("Hotfix 8.1.3 §1-2 — the Dashboard page calls the calendar-aware comparison RPC with the right preset", () => {
-  it("§1 CRITICAL: the page calls get_dashboard_summary_with_comparison and NEVER the bare get_dashboard_summary", async () => {
+  it("§1 CRITICAL: the page calls the calendar-aware summary wrapper and NEVER the bare get_dashboard_summary", async () => {
     await renderDashboard({});
 
     const called = rpcMock.mock.calls.map((c) => c[0]);
-    expect(called).toContain("get_dashboard_summary_with_comparison");
+    // Phase 10 — get_dashboard_summary_with_expenses() (0236) wraps
+    // get_dashboard_summary_with_comparison() (0221), which wraps the
+    // canonical get_dashboard_summary(). The page must call only the
+    // outermost one; the bare summary must never be called directly, which is
+    // the §1 guarantee this test was written for.
+    expect(called).toContain("get_dashboard_summary_with_expenses");
     expect(called).not.toContain("get_dashboard_summary");
+    expect(called).not.toContain("get_dashboard_summary_with_comparison");
   });
 
   it("§4: with NO query params at all, the default month-start→today range is sent as the `this_month` preset (never `custom`, never null)", async () => {

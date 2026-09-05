@@ -596,6 +596,135 @@ describe("GET /api/reports/export — real route handler integration", () => {
     expect(text).not.toContain("أثر مبلغ الاسترداد المعتمد"); // business_effect-only column, must NOT leak in under this basis
   });
 
+  /**
+   * Phase 10 — the Store Expenses export, end to end through the REAL route.
+   * list_store_expenses() returns one envelope carrying rows + summary +
+   * total_count, so it flows through the generic (default) section resolver.
+   * This also pins the §11/§13 row-count contract for the new report: its RPC
+   * caps p_limit at exactly EXPORT_MAX_ROWS (5000), so a full export can never
+   * silently come back short.
+   */
+  it("Phase 10: the expenses report exports a real Excel file with its signed ledger rows and net summary", async () => {
+    requirePermission.mockResolvedValue(sessionWith(new Set(["reports.view", "expenses.view", "reports.export_excel", "reports.export_pdf"])));
+    rpcMock.mockImplementation(
+      rpcRouter({
+        report_visible_stores_lookup: [],
+        list_store_expenses: {
+          total_count: 2,
+          limit: 5000,
+          offset: 0,
+          date_from: "2026-09-01",
+          date_to: "2026-09-30",
+          summary: {
+            entries_count: 2,
+            gross_expenses_total: "1500.00",
+            reversals_total: "-1500.00",
+            operating_expenses_total: "0.00",
+          },
+          rows: [
+            {
+              id: "e1",
+              expense_number: "EXP-0000000001",
+              store_id: "store-1",
+              store_name: "متجر 1",
+              expense_category_id: "cat-1",
+              category_code: "RENT",
+              category_name: "إيجار",
+              business_date: "2026-09-02",
+              entry_kind: "expense",
+              amount: "1500.00",
+              description: "إيجار سبتمبر",
+              reverses_expense_id: null,
+              reversal_reason: null,
+              is_reversed: true,
+            },
+            {
+              id: "e2",
+              expense_number: "EXP-0000000002",
+              store_id: "store-1",
+              store_name: "متجر 1",
+              expense_category_id: "cat-1",
+              category_code: "RENT",
+              category_name: "إيجار",
+              business_date: "2026-09-05",
+              entry_kind: "reversal",
+              amount: "-1500.00",
+              description: "إيجار سبتمبر",
+              reverses_expense_id: "e1",
+              reversal_reason: "دفعة مكررة",
+              is_reversed: false,
+            },
+          ],
+        },
+      }),
+    );
+
+    const req = new NextRequest(exportUrl({ report: "expenses", format: "excel", date_from: "2026-09-01", date_to: "2026-09-30" }));
+    const res = await GET(req);
+
+    expect(res.status).toBe(200);
+    const buf = Buffer.from(await res.arrayBuffer());
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(buf as unknown as ArrayBuffer);
+    const text = allSheetsText(workbook);
+
+    expect(text).toContain("EXP-0000000001");
+    expect(text).toContain("EXP-0000000002");
+    // The reversal renders as a NEGATIVE amount, and the net summary is the
+    // signed total — a reversal must never be subtracted twice.
+    expect(text).toContain("صافي المصروفات التشغيلية");
+    expect(text).toContain("إجمالي العكوسات");
+  });
+
+  it("Phase 10: the expenses export forwards its own filter keys (expense_category_id / entry_kind) to the RPC", async () => {
+    requirePermission.mockResolvedValue(sessionWith(new Set(["reports.view", "expenses.view", "reports.export_excel", "reports.export_pdf"])));
+    rpcMock.mockImplementation(
+      rpcRouter({
+        report_visible_stores_lookup: [],
+        report_categories_lookup: [],
+        report_karats_lookup: [],
+        report_payment_methods_lookup: [],
+        report_collection_channels_lookup: [],
+        report_shipping_carriers_lookup: [],
+        report_shipping_zones_lookup: [],
+        report_adjustment_types_lookup: [],
+        report_settlement_routes_lookup: [],
+        report_employees_lookup: [],
+        list_store_expenses: {
+          total_count: 0,
+          limit: 5000,
+          offset: 0,
+          summary: { entries_count: 0, gross_expenses_total: "0.00", reversals_total: "0.00", operating_expenses_total: "0.00" },
+          rows: [],
+        },
+      }),
+    );
+
+    const req = new NextRequest(
+      exportUrl({
+        report: "expenses",
+        format: "excel",
+        date_from: "2026-09-01",
+        date_to: "2026-09-30",
+        expense_category_id: "cat-1",
+        entry_kind: "reversal",
+      }),
+    );
+    const res = await GET(req);
+
+    expect(res.status).toBe(200);
+    const call = rpcMock.mock.calls.find((c) => c[0] === "list_store_expenses");
+    expect(call![1]).toMatchObject({
+      p_date_from: "2026-09-01",
+      p_date_to: "2026-09-30",
+      p_expense_category_id: "cat-1",
+      p_entry_kind: "reversal",
+      // The full dataset, not a screen page.
+      p_limit: 5000,
+      p_offset: 0,
+    });
+  });
+
   it("rejects an unknown report slug with 404 before ever touching the database", async () => {
     requirePermission.mockResolvedValue(sessionWith(PROFIT_PERMISSIONS));
     const req = new NextRequest(exportUrl({ report: "not-a-real-report", format: "excel" }));

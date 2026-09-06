@@ -109,6 +109,15 @@ export const PERMISSION_KEYS = [
   "expenses.manage_categories",
   "expenses.process_closed_day",
 
+  // Phase 11 (Purchases & Suppliers Core, migration 0237)
+  "purchases.view",
+  "purchases.create",
+  "purchases.reverse",
+  "purchases.record_payment",
+  "purchases.reverse_payment",
+  "purchases.manage_suppliers",
+  "purchases.process_closed_day",
+
   "audit_logs.view",
 
   "settings.manage",

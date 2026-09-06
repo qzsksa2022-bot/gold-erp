@@ -3955,6 +3955,108 @@ export interface Database {
         Args: { p_date_from: string; p_date_to: string; p_period_preset?: string | null; p_store_ids?: string[] | null };
         Returns: Json;
       };
+      // ---------------------------------------------------------------
+      // Phase 11 — Purchases & Suppliers Core (0237-0240). The four base
+      // tables are deliberately NOT declared under `Tables` above: access is
+      // exclusively through these RPCs (Layer-A lockdown, 0238). Every
+      // monetary value is TEXT, never a raw numeric — PostgREST serializes a
+      // numeric as an unquoted JSON number, which a JS float would silently
+      // round.
+      //
+      // Note what is absent by design: no RPC returns a recoverable-input-VAT
+      // figure. Phase 11 records the VAT the supplier charged; it does not
+      // decide what any of it is eligible for.
+      // ---------------------------------------------------------------
+      create_supplier: {
+        Args: {
+          p_code: string;
+          p_name_ar: string;
+          p_name_en?: string | null;
+          p_vat_number?: string | null;
+          p_contact_person?: string | null;
+          p_phone?: string | null;
+          p_email?: string | null;
+          p_notes?: string | null;
+        };
+        Returns: { id: string; code: string; row_version: number }[];
+      };
+      update_supplier: {
+        Args: {
+          p_id: string;
+          p_expected_version: number;
+          p_name_ar: string;
+          p_name_en?: string | null;
+          p_vat_number?: string | null;
+          p_contact_person?: string | null;
+          p_phone?: string | null;
+          p_email?: string | null;
+          p_notes?: string | null;
+        };
+        Returns: { id: string; row_version: number }[];
+      };
+      set_supplier_status: { Args: { p_id: string; p_status: string }; Returns: undefined };
+      post_purchase_invoice: {
+        Args: {
+          p_supplier_id: string;
+          p_store_id: string;
+          // Each line's amounts are strings inside this JSON — see
+          // src/features/purchases/schema.ts.
+          p_lines: Json;
+          p_net_total: string;
+          p_vat_total: string;
+          p_gross_total: string;
+          p_business_date?: string;
+          p_supplier_invoice_number?: string | null;
+          p_supplier_invoice_date?: string | null;
+          p_notes?: string | null;
+          p_closed_day_reason?: string | null;
+        };
+        Returns: { id: string; purchase_number: string; gross_total: string }[];
+      };
+      reverse_purchase_invoice: {
+        Args: { p_invoice_id: string; p_reason: string; p_reversal_business_date?: string; p_closed_day_reason?: string | null };
+        Returns: { id: string; purchase_number: string; gross_total: string }[];
+      };
+      record_supplier_payment: {
+        Args: {
+          p_invoice_id: string;
+          p_amount: string;
+          p_payment_mode: string;
+          p_business_date?: string;
+          p_payment_reference?: string | null;
+          p_notes?: string | null;
+          p_closed_day_reason?: string | null;
+        };
+        Returns: { id: string; payment_number: string; amount: string; outstanding_after: string }[];
+      };
+      reverse_supplier_payment: {
+        Args: { p_payment_id: string; p_reason: string; p_reversal_business_date?: string; p_closed_day_reason?: string | null };
+        Returns: { id: string; payment_number: string; amount: string; outstanding_after: string }[];
+      };
+      list_suppliers: {
+        Args: { p_search?: string | null; p_status?: string | null; p_limit?: number; p_offset?: number };
+        Returns: Json;
+      };
+      list_purchase_invoices: {
+        Args: {
+          p_date_from: string;
+          p_date_to: string;
+          p_store_ids?: string[] | null;
+          p_supplier_id?: string | null;
+          p_entry_kind?: string | null;
+          p_payment_status?: string | null;
+          p_search?: string | null;
+          p_limit?: number;
+          p_offset?: number;
+        };
+        Returns: Json;
+      };
+      get_purchase_invoice: { Args: { p_invoice_id: string }; Returns: Json };
+      get_supplier_outstanding_summary: { Args: { p_store_ids?: string[] | null; p_supplier_id?: string | null }; Returns: Json };
+      get_supplier_statement: {
+        Args: { p_supplier_id: string; p_date_from: string; p_date_to: string; p_store_ids?: string[] | null };
+        Returns: Json;
+      };
       inventory_operable_store_lookups: { Args: Record<string, never>; Returns: { id: string; name_ar: string }[] };
       inventory_visible_store_lookups: { Args: Record<string, never>; Returns: { id: string; name_ar: string }[] };
       inventory_active_item_lookups: { Args: Record<string, never>; Returns: { id: string; sku: string; name_ar: string }[] };

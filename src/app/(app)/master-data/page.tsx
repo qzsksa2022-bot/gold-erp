@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { Gem, Hammer, FolderTree, CreditCard, Landmark, Truck, Wrench, Route, Tags, Percent, ChevronLeft } from "lucide-react";
+import { Gem, Hammer, FolderTree, CreditCard, Landmark, Truck, Wrench, Route, Tags, Percent, Users, ChevronLeft } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { requireAnyPermission } from "@/lib/permissions/guard";
 import { sessionHasPermission } from "@/lib/permissions/session";
@@ -70,6 +70,13 @@ const SECTIONS: { title: string; description: string; href: string; icon: Lucide
     href: ROUTES.expenseCategories,
     icon: Tags,
     permission: "expenses.view",
+  },
+  {
+    title: "الموردون",
+    description: "الموردون الذين تُرحَّل فواتير الشراء باسمهم، مع بياناتهم الضريبية كما وردت منهم.",
+    href: ROUTES.suppliers,
+    icon: Users,
+    permission: "purchases.view",
   },
   {
     title: "مسارات التسوية",

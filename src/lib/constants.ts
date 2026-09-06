@@ -64,6 +64,7 @@ export const ROUTES = {
   // Phase 2 — Financial Master Data (migrations 0040-0046)
   masterData: "/master-data",
   masterDataKarats: "/master-data/karats",
+  masterDataVatRates: "/master-data/vat-rates",
   masterDataManufacturingFees: "/master-data/manufacturing-fees",
   masterDataCategories: "/master-data/categories",
   masterDataPaymentMethods: "/master-data/payment-methods",

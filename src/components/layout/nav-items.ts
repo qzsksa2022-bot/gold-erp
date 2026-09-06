@@ -35,12 +35,19 @@ export type NavItem = {
  * `comingSoon` items still enforce their permission (only shown to users
  * who WILL be able to use the feature once built) but render the
  * lightweight "قريبًا" placeholder page instead of 404.
+ *
+ * Hotfix 10.1.0 — NO item currently sets `comingSoon`. Shipments carried it
+ * until now even though the module has been fully implemented since Phase 5
+ * (3 routes, its own report/export, 4 SQL suites incl. a real dblink
+ * concurrency test), so the sidebar was labelling a working module "قريبًا".
+ * The flag itself is kept as a still-valid capability for a genuinely
+ * unbuilt future module.
  */
 export const NAV_ITEMS: NavItem[] = [
   { label: "الرئيسية", href: ROUTES.dashboard, icon: LayoutDashboard, permission: "dashboard.view" },
   { label: "المبيعات", href: ROUTES.sales, icon: ShoppingCart, permission: "sales.view" },
   { label: "المرتجعات", href: ROUTES.returns, icon: Undo2, permission: "returns.view" },
-  { label: "الشحنات", href: ROUTES.shipments, icon: Truck, permission: "shipments.view", comingSoon: true },
+  { label: "الشحنات", href: ROUTES.shipments, icon: Truck, permission: "shipments.view" },
   { label: "التعديلات والخدمات", href: ROUTES.adjustments, icon: Wrench, permission: "adjustments.view" },
   { label: "التسويات", href: ROUTES.settlements, icon: HandCoins, permission: "settlements.view" },
   { label: "المخزون", href: ROUTES.inventory, icon: Boxes, permission: "inventory.view" },

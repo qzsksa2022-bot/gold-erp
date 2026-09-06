@@ -8,6 +8,9 @@ import type { ReportEnvelope, PaymentMethodsReportEnvelope } from "@/features/re
 // the screen uses (§39 Single Reporting Engine): one aggregation, one source
 // of truth, no parallel export-only query.
 import { getStoreExpenses } from "@/features/expenses/queries";
+// Phase 11 — same §39 rule: the purchases report reuses the SAME
+// list_purchase_invoices() engine the screen uses.
+import { getPurchaseInvoices } from "@/features/purchases/queries";
 import {
   getSalesReport,
   getItemsReport,
@@ -84,6 +87,15 @@ export const COD_STATE_LABELS_AR: Record<string, string> = {
 };
 
 export const SETTLEMENT_STATUS_LABELS_AR: Record<string, string> = { finalized: "مُعتمدة", reconciled: "مُسوّاة" };
+
+/** Phase 11 — `payment_status` is DERIVED per row by list_purchase_invoices() (0240) from immutable ledger facts (gross minus the signed sum of payments), never read from a stored column. */
+export const PURCHASES_PAYMENT_STATUS_LABELS_AR: Record<string, string> = {
+  unpaid: "غير مسددة",
+  partial: "مسددة جزئيًا",
+  paid: "مسددة بالكامل",
+  reversed: "معكوسة",
+  reversal: "مستند عكس",
+};
 
 /** Patch 8.1 §41 — `effective_status` is the correct, WORKING "Cancelled" filter value (computed server-side; raw `status` can never literally be 'cancelled', 0172's CHECK constraint). Hotfix 8.1.1 §28-31 — 'draft' is now a genuinely working value too (0218 fixed the base population to actually admit draft-status batches when explicitly requested; a draft batch contributes zero to the financial ledger, by construction). */
 export const SETTLEMENT_EFFECTIVE_STATUS_LABELS_AR: Record<string, string> = { draft: "مسودة", finalized: "مُعتمدة", reconciled: "مُسوّاة", cancelled: "ملغاة" };
@@ -406,6 +418,41 @@ export const EXPENSES_SUMMARY_FIELDS: SummaryFieldConfig[] = [
   { key: "operating_expenses_total", label: "صافي المصروفات التشغيلية", format: "money", emphasize: true },
 ];
 
+// Phase 11 — Purchases. Every monetary column is TEXT straight from
+// list_purchase_invoices() (0240); the totals are signed, so a reversal
+// document renders negative and the summary is already net.
+//
+// There is deliberately NO recoverable-input-VAT column here. `vat_total` is
+// the VAT the supplier charged, recorded as supplied — Phase 11 stores tax
+// data without deciding eligibility, so any column implying recoverability
+// would assert something this system has not determined.
+export const PURCHASES_COLUMNS: ReportColumnConfig[] = [
+  { key: "purchase_number", label: "رقم المستند", format: "text" },
+  { key: "business_date", label: "التاريخ", format: "date" },
+  { key: "supplier_name", label: "المورّد", format: "text" },
+  { key: "supplier_invoice_number", label: "رقم فاتورة المورّد", format: "text", hiddenOnSmall: true },
+  { key: "store_name", label: "الفرع", format: "text", hiddenOnSmall: true },
+  {
+    key: "payment_status",
+    label: "حالة السداد",
+    format: "badge",
+    labelMap: PURCHASES_PAYMENT_STATUS_LABELS_AR,
+    badgeVariant: (v) => (v === "paid" ? "success" : v === "reversed" || v === "reversal" ? "destructive" : v === "partial" ? "warning" : "secondary"),
+  },
+  { key: "net_total", label: "الصافي", format: "money", hiddenOnSmall: true },
+  { key: "vat_total", label: "ضريبة القيمة المضافة", format: "money", hiddenOnSmall: true },
+  { key: "gross_total", label: "الإجمالي", format: "money" },
+  { key: "outstanding", label: "المتبقي", format: "money" },
+];
+export const PURCHASES_SUMMARY_FIELDS: SummaryFieldConfig[] = [
+  { key: "documents_count", label: "عدد المستندات", format: "int" },
+  { key: "net_total", label: "إجمالي الصافي", format: "money" },
+  { key: "vat_total", label: "إجمالي الضريبة كما وردت من الموردين", format: "money" },
+  { key: "gross_total", label: "إجمالي المشتريات", format: "money" },
+  { key: "paid_total", label: "إجمالي المسدَّد", format: "money" },
+  { key: "outstanding_total", label: "إجمالي المستحق للموردين", format: "money", emphasize: true },
+];
+
 export const TABLE_REPORTS: Record<string, TableReportDefinition> = {
   sales: {
     slug: "sales",
@@ -593,6 +640,23 @@ export const TABLE_REPORTS: Record<string, TableReportDefinition> = {
     // The two are structurally identical — this cast is the boundary between
     // the strict read model and the generic renderer, nothing more.
     fetch: async (f) => (await getStoreExpenses(f as Parameters<typeof getStoreExpenses>[0])) as unknown as ReportEnvelope,
+  },
+  purchases: {
+    slug: "purchases",
+    titleAr: "تقرير المشتريات",
+    descriptionAr:
+      "فواتير الشراء المسجَّلة خلال الفترة لكل مورّد وفرع — سجل إضافي فقط، وحركات العكس تظهر بمبالغ سالبة تُصافي أصلها. تكلفة الشراء هنا توثيقية بحتة: لا تدخل في المصروفات التشغيلية ولا في صافي العائد التشغيلي ولا في تكلفة البضاعة المباعة.",
+    columns: PURCHASES_COLUMNS,
+    summaryFields: PURCHASES_SUMMARY_FIELDS,
+    rowKey: "id",
+    domainPermission: "purchases.view",
+    extraFilterKeys: ["supplier_id", "entry_kind", "payment_status"],
+    // Same §39 boundary note as `expenses` above: getPurchaseInvoices()
+    // returns a precisely-typed envelope for the screen, and the export
+    // pipeline consumes the generic ReportEnvelope shape. The two are
+    // structurally identical — this is the SAME engine the screen calls, not a
+    // parallel export-only query.
+    fetch: async (f) => (await getPurchaseInvoices(f as Parameters<typeof getPurchaseInvoices>[0])) as unknown as ReportEnvelope,
   },
   settlements: {
     slug: "settlements",

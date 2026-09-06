@@ -42,6 +42,11 @@ export const ROUTES = {
   // Phase 10 — Store Expenses Core.
   expenses: "/expenses",
   expenseCategories: "/master-data/expense-categories",
+  // Phase 11 — Purchases & Suppliers Core.
+  purchases: "/purchases",
+  purchasesNew: "/purchases/new",
+  purchasesOutstanding: "/purchases/outstanding",
+  suppliers: "/master-data/suppliers",
   reports: "/reports",
   // Phase 8 — Reports, Dashboard & Exports (§21-§37, migrations 0201-0204).
   reportsSales: "/reports/sales",

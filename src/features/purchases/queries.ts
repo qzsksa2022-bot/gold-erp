@@ -153,9 +153,20 @@ export interface SupplierStatement {
   date_to: string;
   entries: SupplierStatementEntry[];
   summary: {
+    /** Owed before date_from. */
+    opening_balance: string;
     invoiced_total: string;
     paid_total: string;
     net_movement: string;
+    /**
+     * Owed AS OF date_to. Because every entry is immutable and business-dated,
+     * and a correction is a new row carrying its own date (§85), this figure
+     * cannot be changed by anything that happens after date_to — a statement
+     * reads the same tomorrow as it did the day it was issued.
+     */
+    closing_balance: string;
+    /** Owed AS OF TODAY. Differs from closing_balance exactly when there has been activity since date_to. */
+    current_balance: string;
   };
 }
 

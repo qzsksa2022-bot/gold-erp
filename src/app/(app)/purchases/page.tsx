@@ -169,7 +169,10 @@ export default async function PurchasesPage({ searchParams }: { searchParams: Pr
           </p>
         </div>
         <div className="rounded-xl border border-accent/30 bg-accent/5 p-4">
-          <p className="text-xs text-muted-foreground">المستحق للموردين</p>
+          {/* CURRENT settlement state of the period's invoices — not an
+              as-of-period-end balance. The supplier statement is where an
+              as-of-date balance lives. */}
+          <p className="text-xs text-muted-foreground">المستحق حاليًا من فواتير الفترة</p>
           <p className="mt-1 font-mono text-lg font-semibold text-accent" dir="ltr">
             {summary.outstanding_total}
           </p>

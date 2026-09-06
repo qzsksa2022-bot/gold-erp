@@ -442,15 +442,20 @@ export const PURCHASES_COLUMNS: ReportColumnConfig[] = [
   { key: "net_total", label: "الصافي", format: "money", hiddenOnSmall: true },
   { key: "vat_total", label: "ضريبة القيمة المضافة", format: "money", hiddenOnSmall: true },
   { key: "gross_total", label: "الإجمالي", format: "money" },
-  { key: "outstanding", label: "المتبقي", format: "money" },
+  // Settlement state is CURRENT, not as-of the report's end date: the rows are
+  // the documents dated inside the period, shown with what is owed on them
+  // TODAY. Labelling it plainly "المتبقي" invited it to be read as an
+  // as-of-period figure, which it is not — the supplier statement is where an
+  // as-of-date balance lives (get_supplier_statement's closing_balance).
+  { key: "outstanding", label: "المتبقي حاليًا", format: "money" },
 ];
 export const PURCHASES_SUMMARY_FIELDS: SummaryFieldConfig[] = [
   { key: "documents_count", label: "عدد المستندات", format: "int" },
   { key: "net_total", label: "إجمالي الصافي", format: "money" },
   { key: "vat_total", label: "إجمالي الضريبة كما وردت من الموردين", format: "money" },
   { key: "gross_total", label: "إجمالي المشتريات", format: "money" },
-  { key: "paid_total", label: "إجمالي المسدَّد", format: "money" },
-  { key: "outstanding_total", label: "إجمالي المستحق للموردين", format: "money", emphasize: true },
+  { key: "paid_total", label: "المسدَّد من فواتير الفترة حتى الآن", format: "money" },
+  { key: "outstanding_total", label: "المستحق حاليًا من فواتير الفترة", format: "money", emphasize: true },
 ];
 
 export const TABLE_REPORTS: Record<string, TableReportDefinition> = {

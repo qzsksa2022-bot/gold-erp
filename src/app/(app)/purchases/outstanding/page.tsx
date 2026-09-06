@@ -105,6 +105,7 @@ export default async function SupplierOutstandingPage({ searchParams }: { search
             من {formatRiyadhDate(statement.date_from)} إلى {formatRiyadhDate(statement.date_to)}
           </p>
 
+          {/* Period MOVEMENT. */}
           <div className="mb-4 grid grid-cols-1 gap-4 sm:grid-cols-3">
             <div className="rounded-xl border border-border bg-card p-4">
               <p className="text-xs text-muted-foreground">إجمالي المُفوتر خلال الفترة</p>
@@ -123,6 +124,35 @@ export default async function SupplierOutstandingPage({ searchParams }: { search
               <p className="mt-1 font-mono text-lg font-semibold" dir="ltr">
                 {statement.summary.net_movement}
               </p>
+            </div>
+          </div>
+
+          {/* BALANCES. Kept visually separate from the movement figures above,
+              and each labelled with the date it is "as of" — a single
+              unqualified "balance" is exactly what makes a statement
+              impossible to reconcile. */}
+          <div className="mb-4 grid grid-cols-1 gap-4 sm:grid-cols-3">
+            <div className="rounded-xl border border-border bg-card p-4">
+              <p className="text-xs text-muted-foreground">الرصيد الافتتاحي — قبل {formatRiyadhDate(statement.date_from)}</p>
+              <p className="mt-1 font-mono text-lg font-semibold" dir="ltr">
+                {statement.summary.opening_balance}
+              </p>
+            </div>
+            <div className="rounded-xl border border-accent/30 bg-accent/5 p-4">
+              <p className="text-xs text-muted-foreground">الرصيد حتى {formatRiyadhDate(statement.date_to)}</p>
+              <p className="mt-1 font-mono text-lg font-semibold text-accent" dir="ltr">
+                {statement.summary.closing_balance}
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">لا يتأثر بأي حركة لاحقة لهذا التاريخ.</p>
+            </div>
+            <div className="rounded-xl border border-border bg-card p-4">
+              <p className="text-xs text-muted-foreground">الرصيد الحالي — اليوم</p>
+              <p className="mt-1 font-mono text-lg font-semibold" dir="ltr">
+                {statement.summary.current_balance}
+              </p>
+              {statement.summary.current_balance !== statement.summary.closing_balance && (
+                <p className="mt-1 text-xs text-warning">يختلف عن الرصيد حتى تاريخ التقرير بسبب حركات لاحقة.</p>
+              )}
             </div>
           </div>
 

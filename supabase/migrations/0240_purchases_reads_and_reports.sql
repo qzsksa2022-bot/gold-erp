@@ -422,6 +422,9 @@ declare
   v_entries jsonb;
   v_invoiced numeric(14, 2);
   v_paid numeric(14, 2);
+  v_opening numeric(14, 2);
+  v_closing numeric(14, 2);
+  v_current numeric(14, 2);
 begin
   if v_actor is null or not public.has_permission('purchases.view') then
     raise exception 'ليست لديك صلاحية عرض المشتريات' using errcode = 'P0001';
@@ -443,6 +446,57 @@ begin
     end if;
     v_scope := p_store_ids;
   end if;
+
+  -- -------------------------------------------------------------------------
+  -- AS-OF-DATE BALANCES. A statement that reports only period movement cannot
+  -- answer "what did we owe this supplier on the 30th?", so the opening and
+  -- closing balances are computed here from business date alone.
+  --
+  -- Because every document and payment is an immutable, signed, business-dated
+  -- row — and a correction is a NEW row carrying its OWN date (§85) rather
+  -- than an edit — a reversal dated after p_date_to contributes to neither
+  -- balance. A historical statement therefore cannot be altered by anything
+  -- that happens afterwards.
+  --
+  -- `closing_balance` (as of p_date_to) is deliberately distinct from
+  -- `current_balance` (as of today). They differ exactly when activity exists
+  -- after p_date_to, and the two are reported side by side so the reader is
+  -- never left guessing which one a single number meant.
+  -- -------------------------------------------------------------------------
+  select coalesce(sum(x.amount), 0) into v_opening
+  from (
+    select pi.gross_total as amount, pi.business_date
+    from public.purchase_invoices pi
+    where pi.supplier_id = p_supplier_id and pi.store_id = any (v_scope)
+    union all
+    select -sp.amount, sp.business_date
+    from public.supplier_payments sp
+    where sp.supplier_id = p_supplier_id and sp.store_id = any (v_scope)
+  ) x
+  where x.business_date < p_date_from;
+
+  select coalesce(sum(x.amount), 0) into v_closing
+  from (
+    select pi.gross_total as amount, pi.business_date
+    from public.purchase_invoices pi
+    where pi.supplier_id = p_supplier_id and pi.store_id = any (v_scope)
+    union all
+    select -sp.amount, sp.business_date
+    from public.supplier_payments sp
+    where sp.supplier_id = p_supplier_id and sp.store_id = any (v_scope)
+  ) x
+  where x.business_date <= p_date_to;
+
+  select coalesce(sum(x.amount), 0) into v_current
+  from (
+    select pi.gross_total as amount
+    from public.purchase_invoices pi
+    where pi.supplier_id = p_supplier_id and pi.store_id = any (v_scope)
+    union all
+    select -sp.amount
+    from public.supplier_payments sp
+    where sp.supplier_id = p_supplier_id and sp.store_id = any (v_scope)
+  ) x;
 
   select coalesce(sum(pi.gross_total), 0) into v_invoiced
   from public.purchase_invoices pi
@@ -483,9 +537,15 @@ begin
     'date_to', p_date_to,
     'entries', v_entries,
     'summary', jsonb_build_object(
+      'opening_balance', v_opening::text,
       'invoiced_total', v_invoiced::text,
       'paid_total', v_paid::text,
-      'net_movement', (v_invoiced - v_paid)::text
+      'net_movement', (v_invoiced - v_paid)::text,
+      -- Balance owed AS OF p_date_to. opening + net movement, by construction.
+      'closing_balance', v_closing::text,
+      -- Balance owed AS OF TODAY. Equal to closing_balance only when nothing
+      -- happened after p_date_to.
+      'current_balance', v_current::text
     )
   );
 end;

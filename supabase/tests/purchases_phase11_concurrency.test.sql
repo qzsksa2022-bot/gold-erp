@@ -113,7 +113,7 @@ insert into public.user_permission_overrides (user_id, permission_id, effect)
 
 do $$
 declare
-  v_store uuid; v_cat uuid; v_karat uuid; v_item uuid; v_sup uuid;
+  v_store uuid; v_cat uuid; v_karat uuid; v_item uuid; v_item2 uuid; v_sup uuid;
 begin
   set local role authenticated;
   set local request.jwt.claims = '{"sub":"bb000000-0000-4000-8000-000000000001","role":"authenticated"}';
@@ -123,10 +123,14 @@ begin
   insert into public.karats (code, name_ar, sort_order, status) values ('P11CCK', 'عيار تزامن مشتريات', 982, 'active') returning id into v_karat;
 
   select id into v_item from public.create_inventory_item('P11CC-SKU', 'صنف تزامن مشتريات', v_cat, v_karat, 'gram', null);
+  -- A SECOND item, so scenario G can exercise a multi-line invoice holding
+  -- more than one 1008 lock at once.
+  select id into v_item2 from public.create_inventory_item('P11CC-SKU2', 'صنف تزامن مشتريات 2', v_cat, v_karat, 'gram', null);
   select id into v_sup from public.create_supplier('P11CC-SUP', 'مورّد التزامن', 'Concurrency Supplier', '300000000000003');
 
   perform set_config('p11cc.store', v_store::text, false);
   perform set_config('p11cc.item', v_item::text, false);
+  perform set_config('p11cc.item2', v_item2::text, false);
   perform set_config('p11cc.supplier', v_sup::text, false);
 end $$;
 
@@ -161,6 +165,13 @@ begin
     current_setting('p11cc.supplier')::uuid, current_setting('p11cc.store')::uuid,
     current_setting('p11cc.lines')::jsonb, 400, 60, 460, current_date, 'PAY-VS-REV');
   perform set_config('p11cc.inv_e', v_id::text, false);
+
+  -- Scenario H pays into a day that is closed mid-flight, so this invoice must
+  -- be dated on or before that day: a payment may not precede its invoice.
+  select id into v_id from public.post_purchase_invoice(
+    current_setting('p11cc.supplier')::uuid, current_setting('p11cc.store')::uuid,
+    current_setting('p11cc.lines')::jsonb, 400, 60, 460, current_date - 7, 'CLOSE-VS-PAY');
+  perform set_config('p11cc.inv_h', v_id::text, false);
 end $$;
 
 -- ============================================================================
@@ -624,6 +635,168 @@ begin
   assert v_count = 0, format('FAIL F: تسربت %s حركة مخزون من فاتورة مرفوضة — الترحيل ليس ذريًا', v_count);
 
   raise notice 'PASS F: daily-close race — the purchase genuinely blocked on the open EXCLUSIVE close lock, was refused, and left neither an invoice nor a stock movement behind';
+end $$;
+
+-- ============================================================================
+-- G — LOCK ORDERING. A multi-line invoice takes one 1008 lock PER LINE, so it
+-- is the first thing in this codebase to hold several at once. If they were
+-- acquired in client-supplied line order, two operators posting invoices that
+-- share items in opposite orders would form a lock cycle and PostgreSQL would
+-- abort one with 'deadlock detected' — a spurious failure of a valid purchase.
+--
+-- 0239 acquires them in canonical item-id order instead. This scenario proves
+-- that directly: session A holds ONLY the lock that sorts FIRST, then B posts
+-- an invoice whose lines are listed in the OPPOSITE order. Under canonical
+-- ordering B must block on that first lock while holding NOTHING, so nothing
+-- can ever wait on B. Under client ordering B would grab the second item's
+-- lock before blocking — and that held lock is exactly the missing edge of a
+-- deadlock cycle.
+--
+-- The assertion is on `pg_locks` directly rather than on a raced outcome, so
+-- it is deterministic and it fails the moment the ordering loop is removed.
+-- ============================================================================
+do $$
+declare
+  v_a_pid int; v_b_pid int;
+  v_blocked boolean; v_holds_other boolean;
+  v_b_failed boolean := false;
+  v_lo uuid; v_hi uuid; v_lines text;
+begin
+  set local role authenticated;
+  set local request.jwt.claims = '{"sub":"bb000000-0000-4000-8000-000000000001","role":"authenticated"}';
+
+  v_lo := least(current_setting('p11cc.item')::uuid, current_setting('p11cc.item2')::uuid);
+  v_hi := greatest(current_setting('p11cc.item')::uuid, current_setting('p11cc.item2')::uuid);
+
+  -- Lines listed HIGH first — the reverse of the canonical order.
+  v_lines := format(
+    '[{"inventory_item_id":"%s","quantity":1,"unit_net_cost":100,"tax_treatment":"standard","tax_rate_percent":15,"net_amount":100,"vat_amount":15,"gross_amount":115},'
+    '{"inventory_item_id":"%s","quantity":1,"unit_net_cost":100,"tax_treatment":"standard","tax_rate_percent":15,"net_amount":100,"vat_amount":15,"gross_amount":115}]',
+    v_hi, v_lo);
+
+  perform dblink_connect('conn_a', current_setting('p11cc.dblink_conninfo') || ' dbname=' || current_database());
+  perform dblink_connect('conn_b', current_setting('p11cc.dblink_conninfo') || ' dbname=' || current_database());
+
+  select pid into v_a_pid from dblink('conn_a', 'select pg_backend_pid()') as t(pid int);
+  select pid into v_b_pid from dblink('conn_b', 'select pg_backend_pid()') as t(pid int);
+
+  -- A holds ONLY the canonically-first item's lock, standing in for another
+  -- purchase transaction that reached that item first.
+  perform dblink_exec('conn_a', 'begin');
+  perform x from dblink('conn_a', format(
+    $sql$select pg_advisory_xact_lock(1008, hashtext('%s' || ':' || '%s'))$sql$,
+    v_lo, current_setting('p11cc.store'))) as t(x text);
+
+  perform dblink_exec('conn_b', 'set role authenticated');
+  perform dblink_exec('conn_b', $sql$set request.jwt.claims = '{"sub":"bb000000-0000-4000-8000-000000000001","role":"authenticated"}'$sql$);
+  perform dblink_send_query('conn_b', format(
+    $sql$select * from public.post_purchase_invoice('%s'::uuid, '%s'::uuid, '%s'::jsonb, 200, 30, 230, current_date, 'LOCKORDER-B')$sql$,
+    current_setting('p11cc.supplier'), current_setting('p11cc.store'), v_lines));
+
+  v_blocked := public._p11cc_wait_blocked_by(v_b_pid, v_a_pid);
+  assert v_blocked, format(
+    'FAIL G: الترحيل (B، pid %s) لم يُرصد محجوبًا على قفل الصنف الأول الذي تحمله جلسة A (pid %s) — لم يحدث تداخل حقيقي',
+    v_b_pid, v_a_pid);
+
+  -- THE assertion: while blocked, B must hold NO other 1008 lock.
+  select exists (
+    select 1 from pg_locks l
+    where l.locktype = 'advisory' and l.pid = v_b_pid and l.granted
+      and l.classid = 1008
+      and l.objid = hashtext(v_hi::text || ':' || current_setting('p11cc.store'))::bigint::int
+  ) into v_holds_other;
+
+  assert not v_holds_other, format(
+    'FAIL G: الترحيل المحجوب يحمل بالفعل قفل الصنف الآخر (1008/%s) — الأقفال تُؤخذ بترتيب بنود العميل لا بترتيب قانوني، وهذه بالضبط الحافة الناقصة لدورة جمود بين فاتورتين متعددتَي البنود',
+    v_hi);
+
+  perform dblink_exec('conn_a', 'commit');
+
+  perform public._p11cc_wait_ready('conn_b');
+  begin
+    perform id from dblink_get_result('conn_b', true) as t(id uuid, purchase_number text, gross_total text);
+    perform public._p11cc_drain_pending('conn_b');
+  exception when others then
+    v_b_failed := true;
+  end;
+
+  perform dblink_disconnect('conn_a');
+  perform dblink_disconnect('conn_b');
+
+  assert not v_b_failed, 'FAIL G: الترحيل كان يجب أن ينجح بعد تحرير القفل';
+
+  raise notice 'PASS G: multi-line 1008 locks are acquired in canonical item order — a blocked posting holds no other item lock, so no cycle between two multi-line invoices is constructible';
+end $$;
+
+-- ============================================================================
+-- H — Daily Close (EXCLUSIVE 1002) vs RECORDING A PAYMENT (SHARED 1002).
+-- Scenario F proved the guard for invoice posting. The guard has four call
+-- sites, and the payment path is the one that differs structurally: it takes a
+-- ROW lock on the invoice BEFORE asking for the daily-close lock. That order
+-- has to be proved, not assumed — it is also what makes a payment and a close
+-- unable to interleave.
+-- ============================================================================
+do $$
+declare
+  v_a_pid int; v_b_pid int;
+  v_blocked boolean;
+  v_b_failed boolean := false;
+  v_target date := current_date - 6;
+  v_inv uuid;
+  v_count int;
+begin
+  set local role authenticated;
+  set local request.jwt.claims = '{"sub":"bb000000-0000-4000-8000-000000000001","role":"authenticated"}';
+
+  v_inv := current_setting('p11cc.inv_h')::uuid;
+
+  perform dblink_connect('conn_a', current_setting('p11cc.dblink_conninfo') || ' dbname=' || current_database());
+  perform dblink_connect('conn_b', current_setting('p11cc.dblink_conninfo') || ' dbname=' || current_database());
+
+  select pid into v_a_pid from dblink('conn_a', 'select pg_backend_pid()') as t(pid int);
+  select pid into v_b_pid from dblink('conn_b', 'select pg_backend_pid()') as t(pid int);
+
+  perform dblink_exec('conn_a', 'begin');
+  perform dblink_exec('conn_a', 'set role authenticated');
+  perform dblink_exec('conn_a', $sql$set request.jwt.claims = '{"sub":"bb000000-0000-4000-8000-000000000001","role":"authenticated"}'$sql$);
+  perform dblink_exec('conn_b', 'set role authenticated');
+  perform dblink_exec('conn_b', $sql$set request.jwt.claims = '{"sub":"bb000000-0000-4000-8000-000000000001","role":"authenticated"}'$sql$);
+
+  -- A closes the day and HOLDS the exclusive lock.
+  perform x from dblink('conn_a', format(
+    $sql$select public.close_sales_day('%s'::uuid, '%s'::date, 'إغلاق تزامن دفعة')$sql$,
+    current_setting('p11cc.store'), v_target
+  )) as t(x uuid);
+
+  -- B pays into that very day.
+  perform dblink_send_query('conn_b', format(
+    $sql$select * from public.record_supplier_payment('%s'::uuid, 50, 'cash', '%s'::date)$sql$, v_inv, v_target));
+
+  v_blocked := public._p11cc_wait_blocked_by(v_b_pid, v_a_pid);
+  assert v_blocked, format(
+    'FAIL H: تسجيل الدفعة (B، pid %s) لم يُحجب على قفل الإغلاق اليومي الذي تحمله جلسة A (pid %s) — لم يحدث تداخل حقيقي',
+    v_b_pid, v_a_pid);
+
+  perform dblink_exec('conn_a', 'commit');
+
+  perform public._p11cc_wait_ready('conn_b');
+  begin
+    perform id from dblink_get_result('conn_b', true) as t(id uuid, payment_number text, amount text, outstanding_after text);
+    perform public._p11cc_drain_pending('conn_b');
+  exception when others then
+    v_b_failed := true;
+  end;
+
+  perform dblink_disconnect('conn_a');
+  perform dblink_disconnect('conn_b');
+
+  assert v_b_failed, 'FAIL H: سُجِّلت دفعة في يوم أُغلق للتو — الحارس اليومي لم يُطبَّق على مسار الدفع بعد رفع الحجب';
+
+  select count(*) into v_count from public.supplier_payments
+  where purchase_invoice_id = v_inv and business_date = v_target;
+  assert v_count = 0, format('FAIL H: يجب ألا توجد أي دفعة في اليوم المقفل، الموجود: %s', v_count);
+
+  raise notice 'PASS H: daily-close race on the PAYMENT path — the payment genuinely blocked on the open EXCLUSIVE close lock, then was correctly refused';
 end $$;
 
 -- ---------------------------------------------------------------------------

@@ -297,6 +297,7 @@ declare
   v_number text;
   v_line jsonb;
   v_item public.inventory_items%rowtype;
+  v_item_id uuid;
   v_movement_id uuid;
   v_sum_net numeric(14, 2) := 0;
   v_sum_vat numeric(14, 2) := 0;
@@ -419,6 +420,36 @@ begin
   returning purchase_invoices.id, purchase_invoices.gross_total into v_invoice_id, v_stored_gross;
 
   -- ---------------------------------------------------------------------
+  -- DETERMINISTIC LOCK ORDERING — acquire every distinct (item, store) 1008
+  -- lock up front, in canonical item-id order, before posting any movement.
+  -- ---------------------------------------------------------------------
+  -- Phase 11 is the FIRST caller to take more than one 1008 lock in a single
+  -- transaction (Phase 9's engine is called once per user action; a purchase
+  -- invoice calls it once per line). Without this loop the locks are acquired
+  -- in whatever order the client happened to list the lines, so two operators
+  -- posting invoices that share items in opposite orders form a genuine lock
+  -- cycle: A holds item Y and waits for X while B holds X and waits for Y.
+  -- PostgreSQL breaks that cycle by aborting one transaction with
+  -- 'deadlock detected' — a spurious failure of a perfectly valid purchase.
+  --
+  -- Acquiring in a canonical order that every caller shares makes the cycle
+  -- unconstructible: a transaction can only ever wait on a lock that sorts
+  -- after every lock it already holds. Advisory locks are re-entrant within a
+  -- transaction, so record_inventory_stock_movement()'s own acquisition below
+  -- is then a no-op — Phase 9's engine is still the only thing that writes a
+  -- movement, and it is not modified in any way.
+  --
+  -- reverse_purchase_invoice() uses the identical ordering, so a posting and a
+  -- reversal cannot deadlock against each other either.
+  for v_item_id in
+    select distinct (l ->> 'inventory_item_id')::uuid
+    from jsonb_array_elements(p_lines) l
+    order by 1
+  loop
+    perform public.acquire_inventory_item_store_lock(v_item_id, p_store_id);
+  end loop;
+
+  -- ---------------------------------------------------------------------
   -- PASS 2 — the document is proven consistent; now write the lines and move
   -- the stock. Amounts are re-read from the same jsonb, so what is stored is
   -- exactly what was validated above.
@@ -502,6 +533,7 @@ declare
   v_reversal_id uuid;
   v_number text;
   v_line public.purchase_invoice_lines%rowtype;
+  v_item_id uuid;
   v_movement_id uuid;
   v_stored_gross numeric(14, 2);
   v_unreversed int;
@@ -576,6 +608,17 @@ begin
     p_invoice_id, btrim(p_reason), nullif(btrim(coalesce(p_closed_day_reason, '')), ''), v_actor
   )
   returning purchase_invoices.id, purchase_invoices.gross_total into v_reversal_id, v_stored_gross;
+
+  -- Same canonical 1008 lock ordering as post_purchase_invoice(), so a
+  -- reversal and a posting that share items can never form a lock cycle.
+  for v_item_id in
+    select distinct l.inventory_item_id
+    from public.purchase_invoice_lines l
+    where l.purchase_invoice_id = p_invoice_id
+    order by 1
+  loop
+    perform public.acquire_inventory_item_store_lock(v_item_id, v_original.store_id);
+  end loop;
 
   -- Exact compensating inventory movements, dated on the REVERSAL's own
   -- business date. 'adjust' (not 'receive') because the delta is negative —

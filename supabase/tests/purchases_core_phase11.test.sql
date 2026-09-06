@@ -322,7 +322,7 @@ reset role;
 reset request.jwt.claims;
 do $$
 declare
-  v_lines int; v_moves int; v_balance numeric;
+  v_lines int; v_moves int; v_balance numeric; v_mismatch text;
 begin
   select count(*) into v_lines from public.purchase_invoice_lines where purchase_invoice_id = current_setting('p11.inv1')::uuid;
   if v_lines <> 2 then
@@ -345,6 +345,39 @@ begin
     raise exception 'TEST FAILED: a line references a non-existent inventory movement';
   end if;
 
+  -- ---------------------------------------------------------------------
+  -- PER-LINE CORRESPONDENCE. The UNIQUE link proves a line has exactly one
+  -- movement; it says NOTHING about that movement being the RIGHT one. A
+  -- line could point at a movement for another item, another store, another
+  -- quantity or the wrong direction and every constraint would still hold.
+  -- So compare the four fields directly, line by line, for EVERY line of
+  -- EVERY purchase document in the database — not just this invoice.
+  --
+  -- quantity_delta is compared to the line's own SIGNED quantity, which makes
+  -- this one assertion cover both directions: an invoice line is positive and
+  -- posts a 'receive', a reversal line is negative and posts an 'adjust'.
+  -- ---------------------------------------------------------------------
+  select string_agg(format('line %s: item %s/%s store %s/%s qty %s/%s kind %s',
+           l.id, l.inventory_item_id, m.item_id, l.store_id, m.store_id, l.quantity, m.quantity_delta, m.movement_kind), '; ')
+    into v_mismatch
+  from public.purchase_invoice_lines l
+  join public.inventory_stock_movements m on m.id = l.inventory_movement_id
+  where m.item_id is distinct from l.inventory_item_id
+     or m.store_id is distinct from l.store_id
+     or m.quantity_delta is distinct from l.quantity
+     or (l.quantity > 0 and m.movement_kind <> 'receive')
+     or (l.quantity < 0 and m.movement_kind <> 'adjust');
+  if v_mismatch is not null then
+    raise exception 'TEST FAILED: line/movement mismatch — %', v_mismatch;
+  end if;
+
+  -- The scan above is only meaningful if it actually looked at rows.
+  select count(*) into v_lines from public.purchase_invoice_lines l
+  join public.inventory_stock_movements m on m.id = l.inventory_movement_id;
+  if v_lines < 3 then
+    raise exception 'TEST FAILED: the correspondence scan examined only % joined line(s) — too few to be meaningful', v_lines;
+  end if;
+
   -- Stock actually moved, in the right direction and amount.
   select coalesce(sum(quantity_delta), 0) into v_balance
   from public.inventory_stock_movements
@@ -355,6 +388,180 @@ begin
 end;
 $$;
 set role authenticated;
+
+-- ---------------------------------------------------------------------------
+-- 3b. ATOMICITY — a line that fails AFTER an earlier line already posted must
+--     leave nothing at all behind.
+-- ---------------------------------------------------------------------------
+-- This is the case the UNIQUE constraint cannot speak to. Line 1 genuinely
+-- succeeds: its inventory movement is written and its row inserted. Then line
+-- 2 fails on item lookup (a pass-2 failure — pass 1 validates arithmetic, so
+-- an unknown item survives it). If posting were not atomic, the database would
+-- be left holding an invoice header, one orphan line, and — worst of all — a
+-- REAL stock increase for goods that were never recorded as purchased.
+--
+-- The plpgsql BEGIN/EXCEPTION block below is a subtransaction, which models
+-- exactly what PostgREST gives a single RPC call: one statement, one
+-- transaction, all-or-nothing.
+set local request.jwt.claims = '{"sub":"ba000000-0000-4000-8000-000000000001","role":"authenticated"}';
+do $$
+declare
+  v_docs_before int; v_lines_before int; v_moves_before int; v_bal_before numeric;
+  v_docs_after int; v_lines_after int; v_moves_after int; v_bal_after numeric;
+  v_raised boolean := false;
+begin
+  select count(*) into v_docs_before from public.purchase_invoices;
+  select count(*) into v_lines_before from public.purchase_invoice_lines;
+  select count(*) into v_moves_before from public.inventory_stock_movements;
+  select coalesce(sum(quantity_delta), 0) into v_bal_before
+  from public.inventory_stock_movements
+  where item_id = current_setting('p11.item')::uuid and store_id = current_setting('p11.store_a')::uuid;
+
+  begin
+    perform public.post_purchase_invoice(
+      current_setting('p11.supplier')::uuid, current_setting('p11.store_a')::uuid,
+      jsonb_build_array(
+        -- Line 1 is entirely valid and WILL post its movement first.
+        jsonb_build_object('inventory_item_id', current_setting('p11.item'), 'quantity', 7, 'unit_net_cost', 100,
+          'tax_treatment', 'standard', 'tax_rate_percent', 15, 'net_amount', 700, 'vat_amount', 105, 'gross_amount', 805),
+        -- Line 2 references an item that does not exist — a pass-2 failure,
+        -- raised only after line 1 has already been written.
+        jsonb_build_object('inventory_item_id', '00000000-0000-4000-8000-0000000000ff', 'quantity', 3, 'unit_net_cost', 100,
+          'tax_treatment', 'standard', 'tax_rate_percent', 15, 'net_amount', 300, 'vat_amount', 45, 'gross_amount', 345)
+      ),
+      1000, 150, 1150, current_date, 'ATOMIC-1');
+    raise exception 'TEST FAILED: an invoice with an unknown item on line 2 was accepted';
+  exception when others then
+    if sqlerrm like 'TEST FAILED%' then raise; end if;
+    if sqlerrm not like '%الصنف غير موجود%' then raise; end if;
+    v_raised := true;
+  end;
+
+  if not v_raised then
+    raise exception 'TEST FAILED: the failing line did not raise at all — the atomicity check never got to run';
+  end if;
+
+  select count(*) into v_docs_after from public.purchase_invoices;
+  select count(*) into v_lines_after from public.purchase_invoice_lines;
+  select count(*) into v_moves_after from public.inventory_stock_movements;
+  select coalesce(sum(quantity_delta), 0) into v_bal_after
+  from public.inventory_stock_movements
+  where item_id = current_setting('p11.item')::uuid and store_id = current_setting('p11.store_a')::uuid;
+
+  if v_docs_after <> v_docs_before then
+    raise exception 'TEST FAILED (atomicity): a partial invoice header survived — % documents before, % after', v_docs_before, v_docs_after;
+  end if;
+  if v_lines_after <> v_lines_before then
+    raise exception 'TEST FAILED (atomicity): % orphan invoice line(s) survived the failed posting', v_lines_after - v_lines_before;
+  end if;
+  if v_moves_after <> v_moves_before then
+    raise exception 'TEST FAILED (atomicity): % inventory movement(s) leaked from a failed posting — stock rose for goods never recorded as purchased', v_moves_after - v_moves_before;
+  end if;
+  if v_bal_after <> v_bal_before then
+    raise exception 'TEST FAILED (atomicity): the item balance moved from % to % despite the posting failing', v_bal_before, v_bal_after;
+  end if;
+
+  -- And nothing is recoverable by document number either.
+  if exists (select 1 from public.purchase_invoices where supplier_invoice_number = 'ATOMIC-1') then
+    raise exception 'TEST FAILED (atomicity): the failed invoice is still addressable by its supplier invoice number';
+  end if;
+end;
+$$;
+
+-- The counts above prove the END STATE is clean. They do NOT by themselves
+-- prove a partial write was ever ATTEMPTED — if the RPC happened to validate
+-- every item before posting anything, the assertions would pass without the
+-- interesting path ever executing, and the test would be a false positive.
+--
+-- So assert the structure that makes the attempt real: line N's item lookup
+-- and line N's inventory posting live in the SAME loop iteration, which means
+-- line 1's movement is genuinely written before line 2 is ever looked at.
+reset role;
+reset request.jwt.claims;
+do $$
+declare
+  v_src text; v_pass2 text;
+  v_check int; v_post int; v_endloop int;
+begin
+  select pg_get_functiondef(p.oid) into v_src
+  from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+  where n.nspname = 'public' and p.proname = 'post_purchase_invoice';
+
+  v_pass2 := substr(v_src, position('PASS 2' in v_src));
+  if v_pass2 = '' then
+    raise exception 'TEST FAILED: could not locate the posting pass in post_purchase_invoice — this structural check is not actually inspecting anything';
+  end if;
+
+  v_check   := position('الصنف غير موجود' in v_pass2);
+  v_post    := position('record_inventory_stock_movement' in v_pass2);
+  v_endloop := position('end loop' in v_pass2);
+
+  if v_check = 0 or v_post = 0 or v_endloop = 0 then
+    raise exception 'TEST FAILED: the posting pass no longer contains the per-line item check (%), the engine call (%) or a loop (%)', v_check, v_post, v_endloop;
+  end if;
+  if v_check > v_endloop or v_post > v_endloop then
+    raise exception 'TEST FAILED: the item check and the inventory posting are no longer in the SAME per-line loop — the atomicity test above would stop exercising a genuine partial write';
+  end if;
+end;
+$$;
+set role authenticated;
+set local request.jwt.claims = '{"sub":"ba000000-0000-4000-8000-000000000001","role":"authenticated"}';
+
+-- The same must hold when the failing line names a DISABLED item, which is a
+-- different pass-2 rejection path.
+--
+-- The item is flipped inactive as superuser rather than through
+-- update_inventory_item(): this actor holds no item-management permission, and
+-- an RLS-blocked UPDATE matches zero rows SILENTLY instead of raising — which
+-- would leave the item active and make the whole check pass for the wrong
+-- reason. The subject under test is the purchase RPC, not the item RPC.
+reset role;
+reset request.jwt.claims;
+update public.inventory_items set active = false where sku = 'P11-SKU-2';
+do $$
+begin
+  if not exists (select 1 from public.inventory_items where sku = 'P11-SKU-2' and not active) then
+    raise exception 'TEST FAILED: fixture did not disable P11-SKU-2 — the disabled-item check would be vacuous';
+  end if;
+end $$;
+set role authenticated;
+set local request.jwt.claims = '{"sub":"ba000000-0000-4000-8000-000000000001","role":"authenticated"}';
+
+do $$
+declare
+  v_moves_before int; v_moves_after int; v_disabled uuid;
+begin
+  select id into v_disabled from public.inventory_items where sku = 'P11-SKU-2';
+
+  select count(*) into v_moves_before from public.inventory_stock_movements;
+  begin
+    perform public.post_purchase_invoice(
+      current_setting('p11.supplier')::uuid, current_setting('p11.store_a')::uuid,
+      jsonb_build_array(
+        jsonb_build_object('inventory_item_id', current_setting('p11.item'), 'quantity', 2, 'unit_net_cost', 100,
+          'tax_treatment', 'standard', 'tax_rate_percent', 15, 'net_amount', 200, 'vat_amount', 30, 'gross_amount', 230),
+        jsonb_build_object('inventory_item_id', v_disabled, 'quantity', 2, 'unit_net_cost', 100,
+          'tax_treatment', 'standard', 'tax_rate_percent', 15, 'net_amount', 200, 'vat_amount', 30, 'gross_amount', 230)
+      ),
+      400, 60, 460, current_date, 'ATOMIC-2');
+    raise exception 'TEST FAILED: an invoice naming a DISABLED item was accepted';
+  exception when others then
+    if sqlerrm like 'TEST FAILED%' then raise; end if;
+    if sqlerrm not like '%غير نشط%' then raise; end if;
+  end;
+
+  select count(*) into v_moves_after from public.inventory_stock_movements;
+  if v_moves_after <> v_moves_before then
+    raise exception 'TEST FAILED (atomicity): % movement(s) leaked when line 2 named a disabled item', v_moves_after - v_moves_before;
+  end if;
+end;
+$$;
+
+reset role;
+reset request.jwt.claims;
+update public.inventory_items set active = true where sku = 'P11-SKU-2';
+set role authenticated;
+set local request.jwt.claims = '{"sub":"ba000000-0000-4000-8000-000000000001","role":"authenticated"}';
 
 -- ---------------------------------------------------------------------------
 -- 4. Payments — partial, overpayment refused, derived outstanding.
@@ -591,6 +798,82 @@ begin
   if v_id is null then
     raise exception 'TEST FAILED: a permitted closed-day invoice with a reason was not posted';
   end if;
+  perform set_config('p11.closed_inv', v_id::text, false);
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 7b. The daily-close guard has FOUR call sites, not one. Posting is covered
+--     above; the payment, invoice-reversal and payment-reversal paths each
+--     call the guard separately, so each is proved separately here. A guard
+--     that is wired into one path and quietly missing from another is exactly
+--     the kind of gap that only shows up as a mutated closed period.
+-- ---------------------------------------------------------------------------
+set local request.jwt.claims = '{"sub":"ba000000-0000-4000-8000-000000000001","role":"authenticated"}';
+do $$
+declare v_pay uuid;
+begin
+  -- (i) PAYMENT into a closed day, by an actor WITHOUT process_closed_day.
+  begin
+    perform public.record_supplier_payment(current_setting('p11.closed_inv')::uuid, 1, 'cash', current_date - 6);
+    raise exception 'TEST FAILED: a payment was recorded into a CLOSED day without purchases.process_closed_day';
+  exception when others then
+    if sqlerrm like 'TEST FAILED%' then raise; end if;
+    if sqlerrm not like '%يوم مقفل%' then raise; end if;
+  end;
+
+  -- (ii) INVOICE REVERSAL dated into a closed day. §85: the guard must be
+  -- applied to the REVERSAL's own date, not the original invoice's.
+  begin
+    perform public.reverse_purchase_invoice(current_setting('p11.closed_inv')::uuid, 'عكس في يوم مقفل', current_date - 6);
+    raise exception 'TEST FAILED: an invoice was reversed INTO a closed day without purchases.process_closed_day';
+  exception when others then
+    if sqlerrm like 'TEST FAILED%' then raise; end if;
+    if sqlerrm not like '%يوم مقفل%' then raise; end if;
+  end;
+end;
+$$;
+
+-- The privileged actor may do both, with a reason — and (iii) the payment
+-- reversal path is guarded on its own date too.
+set local request.jwt.claims = '{"sub":"ba000000-0000-4000-8000-000000000006","role":"authenticated"}';
+do $$
+declare v_pay uuid; v_out text;
+begin
+  -- A payment on the closed day, permitted and reasoned.
+  select id into v_pay from public.record_supplier_payment(
+    current_setting('p11.closed_inv')::uuid, 5, 'cash', current_date - 6, null, null, 'دفعة متأخرة معتمدة');
+  if v_pay is null then
+    raise exception 'TEST FAILED: a permitted closed-day payment with a reason was not recorded';
+  end if;
+
+  -- Reversing THAT payment into the same closed day: still guarded, and the
+  -- reason is still mandatory even for the privileged actor.
+  begin
+    perform public.reverse_supplier_payment(v_pay, 'عكس دفعة', current_date - 6);
+    raise exception 'TEST FAILED: a closed-day payment reversal was accepted without a reason';
+  exception when others then
+    if sqlerrm like 'TEST FAILED%' then raise; end if;
+    if sqlerrm not like '%سبب%' then raise; end if;
+  end;
+
+  select outstanding_after into v_out from public.reverse_supplier_payment(
+    v_pay, 'عكس دفعة', current_date - 6, 'عكس متأخر معتمد');
+  if v_out <> '11.50' then
+    raise exception 'TEST FAILED: reversing the closed-day payment should restore outstanding to 11.50, got %', v_out;
+  end if;
+end;
+$$;
+
+-- And the invoice-reversal path, permitted + reasoned, on the closed day.
+do $$
+declare v_gross text;
+begin
+  select gross_total into v_gross from public.reverse_purchase_invoice(
+    current_setting('p11.closed_inv')::uuid, 'عكس في يوم مقفل', current_date - 6, 'عكس متأخر معتمد');
+  if v_gross <> '-11.50' then
+    raise exception 'TEST FAILED: expected the closed-day reversal gross_total=-11.50, got %', v_gross;
+  end if;
 end;
 $$;
 
@@ -638,10 +921,98 @@ begin
     raise exception 'TEST FAILED: statement paid_total should net to 0.00 after both reversals, got %', v -> 'summary' ->> 'paid_total';
   end if;
 
-  -- Outstanding liabilities exclude reversed invoices entirely.
+  -- Outstanding liabilities exclude reversed invoices entirely. Only the
+  -- second supplier's 50.00 remains: inv1 and the closed-day invoice have both
+  -- been reversed by now, and a reversed invoice owes nothing.
   v := public.get_supplier_outstanding_summary();
-  if v -> 'summary' ->> 'outstanding_total' <> '61.50' then -- 50 (supplier2) + 11.50 (closed-day)
-    raise exception 'TEST FAILED: expected outstanding_total=61.50, got %', v -> 'summary' ->> 'outstanding_total';
+  if v -> 'summary' ->> 'outstanding_total' <> '50.00' then
+    raise exception 'TEST FAILED: expected outstanding_total=50.00, got %', v -> 'summary' ->> 'outstanding_total';
+  end if;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 8b. AS-OF-DATE SEMANTICS — a later-dated correction must never rewrite an
+--     already-reported historical balance.
+-- ---------------------------------------------------------------------------
+-- This is the property that makes a purchase ledger auditable at all. Because
+-- every document and payment is immutable, signed and business-dated, and a
+-- correction is a NEW row carrying its OWN date (§85), a statement issued for
+-- September must read the same tomorrow as it did on 1 October — no matter
+-- what reversals happen in between.
+do $$
+declare
+  v_sup uuid; v_inv uuid; v_pay uuid; v jsonb;
+  v_close_before text; v_open_before text; v_cur_before text;
+  v_close_after text; v_cur_after text;
+  v_d0 date := current_date - 20;   -- inside the reported period
+  v_from date := current_date - 25;
+  v_to date := current_date - 15;
+begin
+  -- A dedicated supplier, so this section's arithmetic is not entangled with
+  -- anything above.
+  select id into v_sup from public.create_supplier('P11-ASOF', 'مورّد كشف الحساب');
+
+  select id into v_inv from public.post_purchase_invoice(
+    v_sup, current_setting('p11.store_a')::uuid,
+    jsonb_build_array(jsonb_build_object('inventory_item_id', current_setting('p11.item'), 'quantity', 1, 'unit_net_cost', 1000,
+      'tax_treatment', 'standard', 'tax_rate_percent', 15, 'net_amount', 1000, 'vat_amount', 150, 'gross_amount', 1150)),
+    1000, 150, 1150, v_d0, 'ASOF-1');
+
+  select id into v_pay from public.record_supplier_payment(v_inv, 400, 'cash', v_d0 + 1);
+
+  v := public.get_supplier_statement(v_sup, v_from, v_to);
+  v_open_before := v -> 'summary' ->> 'opening_balance';
+  v_close_before := v -> 'summary' ->> 'closing_balance';
+  v_cur_before := v -> 'summary' ->> 'current_balance';
+
+  if v_open_before <> '0.00' then
+    raise exception 'TEST FAILED: expected opening_balance 0.00 before any activity, got %', v_open_before;
+  end if;
+  if v_close_before <> '750.00' then -- 1150 invoiced − 400 paid, both inside the period
+    raise exception 'TEST FAILED: expected closing_balance 750.00 as of the period end, got %', v_close_before;
+  end if;
+  if v_cur_before <> '750.00' then
+    raise exception 'TEST FAILED: with no later activity, current_balance must equal closing_balance, got %', v_cur_before;
+  end if;
+
+  -- Now correct BOTH the payment and the invoice, dated TODAY — long after the
+  -- reported period closed.
+  perform public.reverse_supplier_payment(v_pay, 'تصحيح لاحق', current_date);
+  perform public.reverse_purchase_invoice(v_inv, 'تصحيح لاحق', current_date);
+
+  v := public.get_supplier_statement(v_sup, v_from, v_to);
+  v_close_after := v -> 'summary' ->> 'closing_balance';
+  v_cur_after := v -> 'summary' ->> 'current_balance';
+
+  -- THE assertion: the historical figures are untouched.
+  if v_close_after <> v_close_before then
+    raise exception 'TEST FAILED (as-of-date): a reversal dated today changed the closing balance of a period that ended % — was %, now %', v_to, v_close_before, v_close_after;
+  end if;
+  if v -> 'summary' ->> 'opening_balance' <> v_open_before then
+    raise exception 'TEST FAILED (as-of-date): a later reversal changed the opening balance';
+  end if;
+  if v -> 'summary' ->> 'invoiced_total' <> '1150.00' or v -> 'summary' ->> 'paid_total' <> '400.00' then
+    raise exception 'TEST FAILED (as-of-date): a later reversal changed the period movement (invoiced %, paid %)',
+      v -> 'summary' ->> 'invoiced_total', v -> 'summary' ->> 'paid_total';
+  end if;
+  if jsonb_array_length(v -> 'entries') <> 2 then
+    raise exception 'TEST FAILED (as-of-date): the period should still contain exactly its own 2 entries, got %', jsonb_array_length(v -> 'entries');
+  end if;
+
+  -- ...while the CURRENT balance did move, and the two are reported as
+  -- separate numbers so a reader is never left guessing which one they have.
+  if v_cur_after <> '0.00' then
+    raise exception 'TEST FAILED: after reversing both documents the current balance must be 0.00, got %', v_cur_after;
+  end if;
+  if v_cur_after = v_close_after then
+    raise exception 'TEST FAILED: current_balance and closing_balance are indistinguishable — the as-of-date distinction is not actually being made';
+  end if;
+
+  -- A statement whose window ENDS today does see the corrections.
+  v := public.get_supplier_statement(v_sup, v_from, current_date);
+  if v -> 'summary' ->> 'closing_balance' <> '0.00' then
+    raise exception 'TEST FAILED: a window ending today should close at 0.00, got %', v -> 'summary' ->> 'closing_balance';
   end if;
 end;
 $$;

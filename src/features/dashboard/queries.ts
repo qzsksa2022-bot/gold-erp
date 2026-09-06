@@ -56,6 +56,32 @@ export async function getDashboardSummaryWithComparison(dateFrom: string, dateTo
 }
 
 /**
+ * Phase 10 — the EXPENSE-AWARE Dashboard summary.
+ * `get_dashboard_summary_with_expenses()` (migration 0236) calls the
+ * calendar-aware wrapper above and only ADDS to its result:
+ *
+ *   * an `expenses` section (gated on expenses.view, §79 true key-absence), and
+ *   * inside `net_operating_return`, the explicit triad
+ *     `operating_contribution_before_expenses` /
+ *     `operating_expenses_total` / `net_operating_result_after_expenses`.
+ *
+ * The legacy `net_operating_return` key is carried through byte-for-byte
+ * unchanged — it always meant "contribution BEFORE operating expenses" and
+ * still does, so no historical figure or existing caller changes meaning.
+ */
+export async function getDashboardSummaryWithExpenses(dateFrom: string, dateTo: string, periodPreset?: string, storeIds?: string[]) {
+  const supabase = await createClient();
+  const { data, error } = await supabase.rpc("get_dashboard_summary_with_expenses", {
+    p_date_from: dateFrom,
+    p_date_to: dateTo,
+    p_period_preset: periodPreset ?? null,
+    p_store_ids: storeIds ?? null,
+  });
+  if (error) throw error;
+  return data as unknown as Record<string, unknown>;
+}
+
+/**
  * Phase 8 §19/§73 — Trend charts. get_dashboard_trends() (migration 0200)
  * returns `{ granularity, date_from, date_to, buckets: [...] }`, every
  * bucket zero-filled (no missing chart points) at the auto-derived

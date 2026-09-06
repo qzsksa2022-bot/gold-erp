@@ -89,6 +89,14 @@ export const AUDIT_ACTION_LABELS_AR: Record<string, string> = {
   // the spec names, not a mechanical <table>.<insert|update|delete>).
   "vat_rate_version.create": "إنشاء إصدار ضريبة قيمة مضافة",
   "vat_rate_version.update": "تعديل إصدار ضريبة قيمة مضافة (بما في ذلك إلغاء نسخة مستقبلية)",
+
+  // Phase 10 — Store Expenses Core (migrations 0233-0236)
+  "expense_category.create": "إنشاء تصنيف مصروف",
+  "expense_category.update": "تعديل تصنيف مصروف",
+  "expense_category.enable": "تفعيل تصنيف مصروف",
+  "expense_category.disable": "تعطيل تصنيف مصروف",
+  "expense.record": "تسجيل مصروف",
+  "expense.reverse": "عكس مصروف",
   "sale.create": "إنشاء عملية بيع",
   "sale.update": "تعديل عملية بيع",
   "sale.closed_day_update": "تعديل/إنشاء عملية بيع بعد إغلاق اليوم",
@@ -140,6 +148,10 @@ export const AUDIT_ENTITY_LABELS_AR: Record<string, string> = {
   // Phase 4 — Returns Core
   sales_return: "مرتجع",
   sales_return_refund_event: "سجل استرداد نقدي",
+
+  // Phase 10 — Store Expenses Core
+  expense_category: "تصنيف مصروف",
+  store_expense: "حركة مصروف",
 };
 
 export function auditEntityLabel(entityType: string): string {

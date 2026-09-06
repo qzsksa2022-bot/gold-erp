@@ -250,7 +250,12 @@ describe("NetOperatingReturnCard — §18/§20 formula + §79 redaction", () => 
       net_operating_return: "975.00",
     };
     const { container } = render(<NetOperatingReturnCard nor={nor} />);
-    expect(screen.getByText(/صافي العائد التشغيلي — Net Operating Return/)).toBeInTheDocument();
+    // Phase 10 relabelled this heading. The VALUE and its formula are
+    // unchanged — `net_operating_return` always was a contribution measured
+    // BEFORE operating expenses (its formula has no expense term) — so the
+    // card now says so explicitly rather than letting it be read as an
+    // after-expenses result. The assertion still pins the heading exactly.
+    expect(screen.getByText(/المساهمة التشغيلية قبل المصروفات — Operating Contribution \(before expenses\)/)).toBeInTheDocument();
     // The hero total AND the trailing "= total" line both render the same
     // formatted figure — at least twice, via the SAME formatSAR() the rest
     // of the app uses (avoids hard-coding ar-SA's Arabic-Indic digit glyphs).

@@ -4,6 +4,10 @@ import type { ReportColumnConfig } from "@/features/reports/components/report-ta
 import type { SummaryFieldConfig } from "@/features/reports/components/report-summary-cards";
 import type { PermissionKey } from "@/lib/permissions/constants";
 import type { ReportEnvelope, PaymentMethodsReportEnvelope } from "@/features/reports/queries";
+// Phase 10 — the expenses report reuses the SAME list_store_expenses() engine
+// the screen uses (§39 Single Reporting Engine): one aggregation, one source
+// of truth, no parallel export-only query.
+import { getStoreExpenses } from "@/features/expenses/queries";
 import {
   getSalesReport,
   getItemsReport,
@@ -383,6 +387,25 @@ export const SETTLEMENTS_SUMMARY_FIELDS: SummaryFieldConfig[] = [
   { key: "variance", label: "الفرق", format: "money", emphasize: true, permission: "settlements.view_financials" },
 ];
 
+// Phase 10 — Store Expenses. Every monetary column is TEXT straight from
+// list_store_expenses() (0235); `amount` is signed, so a reversal row renders
+// negative and the summary's operating_expenses_total is already net.
+export const EXPENSES_COLUMNS: ReportColumnConfig[] = [
+  { key: "expense_number", label: "رقم المصروف", format: "text" },
+  { key: "business_date", label: "التاريخ", format: "date" },
+  { key: "store_name", label: "الفرع", format: "text" },
+  { key: "category_name", label: "التصنيف", format: "text" },
+  { key: "entry_kind", label: "نوع الحركة", format: "text" },
+  { key: "amount", label: "المبلغ", format: "money" },
+  { key: "description", label: "الوصف", format: "text", hiddenOnSmall: true },
+];
+export const EXPENSES_SUMMARY_FIELDS: SummaryFieldConfig[] = [
+  { key: "entries_count", label: "عدد الحركات", format: "int" },
+  { key: "gross_expenses_total", label: "إجمالي المصروفات", format: "money" },
+  { key: "reversals_total", label: "إجمالي العكوسات", format: "money" },
+  { key: "operating_expenses_total", label: "صافي المصروفات التشغيلية", format: "money", emphasize: true },
+];
+
 export const TABLE_REPORTS: Record<string, TableReportDefinition> = {
   sales: {
     slug: "sales",
@@ -554,6 +577,22 @@ export const TABLE_REPORTS: Record<string, TableReportDefinition> = {
     ],
     booleanFilterKeys: ["participates_in_settlement"],
     fetch: (f) => getAdjustmentsReport(f as Parameters<typeof getAdjustmentsReport>[0]),
+  },
+  expenses: {
+    slug: "expenses",
+    titleAr: "تقرير مصروفات الفروع",
+    descriptionAr: "المصروفات التشغيلية المسجَّلة خلال الفترة لكل فرع وتصنيف — سجل إضافي فقط، وحركات العكس تظهر بمبالغ سالبة تُصافي أصلها.",
+    columns: EXPENSES_COLUMNS,
+    summaryFields: EXPENSES_SUMMARY_FIELDS,
+    rowKey: "id",
+    domainPermission: "expenses.view",
+    extraFilterKeys: ["expense_category_id", "entry_kind"],
+    // getStoreExpenses() returns a precisely-typed StoreExpensesEnvelope for
+    // the screen; the export pipeline consumes the generic ReportEnvelope
+    // shape (Record<string, unknown> rows, since it renders columns by key).
+    // The two are structurally identical — this cast is the boundary between
+    // the strict read model and the generic renderer, nothing more.
+    fetch: async (f) => (await getStoreExpenses(f as Parameters<typeof getStoreExpenses>[0])) as unknown as ReportEnvelope,
   },
   settlements: {
     slug: "settlements",

@@ -309,9 +309,75 @@ begin
   raise notice 'PASS G: date_from > date_to correctly rejected';
 end $$;
 
+-- ---------------------------------------------------------------------------
+-- (H) Phase 10 — expenses must NOT move the legacy figure, and the new
+--     after-expenses figure must be independently correct.
+-- ---------------------------------------------------------------------------
+-- The whole backward-compatibility promise of Phase 10 is asserted here
+-- against the SAME golden scenario the legacy value (68.00) is proven on
+-- above: a real July expense is posted, and then BOTH numbers are checked.
+-- Assertion A9's 68.00 must survive verbatim — an expense may never silently
+-- change what net_operating_return has always meant — while the new
+-- net_operating_result_after_expenses reflects it.
+do $$
+declare
+  v_legacy jsonb;
+  v_new jsonb;
+  v_cat uuid;
+  v_nor text;
+  v_contribution text;
+  v_expenses text;
+  v_after text;
+begin
+  perform set_config('request.jwt.claims', json_build_object('sub', '80000000-0000-4000-8000-000000000001', 'role', 'authenticated')::text, true);
+
+  select id into v_cat from public.create_expense_category('P8G-EXP', 'مصروف السيناريو الذهبي');
+  perform public.record_store_expense(
+    '80100000-0000-4000-8000-000000000001'::uuid, v_cat, 18.00, date '2026-07-15', 'إيجار يوليو - سيناريو ذهبي'
+  );
+
+  -- 1) The LEGACY contract is untouched, with a real expense now on the books.
+  v_legacy := public.get_dashboard_summary('2026-07-01', '2026-07-31', null);
+  v_nor := v_legacy -> 'net_operating_return' ->> 'net_operating_return';
+  if v_nor <> '68.00' then
+    raise exception 'FAIL H1 (CRITICAL backward compatibility): July net_operating_return must STILL be 68.00 after an expense exists, got %', v_nor;
+  end if;
+  if v_legacy ? 'expenses' or (v_legacy -> 'net_operating_return') ? 'net_operating_result_after_expenses' then
+    raise exception 'FAIL H2: the legacy get_dashboard_summary() leaked Phase 10 keys';
+  end if;
+
+  -- The calendar-aware wrapper (0221) is equally untouched.
+  if public.get_dashboard_summary_with_comparison('2026-07-01', '2026-07-31', 'monthly', null)
+       -> 'net_operating_return' ->> 'net_operating_return' <> '68.00' then
+    raise exception 'FAIL H3 (CRITICAL backward compatibility): the comparison wrapper''s July net_operating_return changed';
+  end if;
+
+  -- 2) The NEW expense-aware view reports both numbers, independently.
+  v_new := public.get_dashboard_summary_with_expenses('2026-07-01', '2026-07-31', 'monthly', null);
+  v_contribution := v_new -> 'net_operating_return' ->> 'operating_contribution_before_expenses';
+  v_expenses := v_new -> 'net_operating_return' ->> 'operating_expenses_total';
+  v_after := v_new -> 'net_operating_return' ->> 'net_operating_result_after_expenses';
+
+  if v_new -> 'net_operating_return' ->> 'net_operating_return' <> '68.00' then
+    raise exception 'FAIL H4 (CRITICAL): the expense-aware RPC must still carry the legacy net_operating_return=68.00 verbatim, got %',
+      v_new -> 'net_operating_return' ->> 'net_operating_return';
+  end if;
+  if v_contribution <> '68.00' then
+    raise exception 'FAIL H5: expected operating_contribution_before_expenses=68.00, got %', v_contribution;
+  end if;
+  if v_expenses <> '18.00' then
+    raise exception 'FAIL H6: expected operating_expenses_total=18.00, got %', v_expenses;
+  end if;
+  if v_after <> '50.00' then
+    raise exception 'FAIL H7 (CRITICAL): expected net_operating_result_after_expenses=50.00 (68.00 - 18.00), got %', v_after;
+  end if;
+
+  raise notice 'PASS H: an 18.00 July expense leaves net_operating_return at 68.00 exactly, while the new after-expenses result reports 50.00 — both proven independently on the same golden scenario';
+end $$;
+
 do $$
 begin
-  raise notice '=== ALL reports_dashboard_golden_scenario.test.sql ASSERTIONS PASSED (§81/§82/§85/§39/§79/§8/§4) ===';
+  raise notice '=== ALL reports_dashboard_golden_scenario.test.sql ASSERTIONS PASSED (§81/§82/§85/§39/§79/§8/§4 + Phase 10 §H) ===';
 end $$;
 
 rollback;

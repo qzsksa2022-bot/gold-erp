@@ -1,6 +1,6 @@
 import { AlertTriangle } from "lucide-react";
 import { requirePermission } from "@/lib/permissions/guard";
-import { getDashboardStats, getDashboardSummaryWithComparison, getDashboardTrends } from "@/features/dashboard/queries";
+import { getDashboardStats, getDashboardSummaryWithExpenses, getDashboardTrends } from "@/features/dashboard/queries";
 import { getReportVisibleStores } from "@/features/reports/queries";
 import { PageHeader } from "@/components/shared/page-header";
 import { StatCard } from "@/features/dashboard/components/stat-card";
@@ -63,10 +63,14 @@ export default async function DashboardPage({ searchParams }: { searchParams: Pr
 
   const [stats, summary, trends, stores] = await Promise.all([
     getDashboardStats(),
-    // Hotfix 8.1.3 §1 — the CALENDAR-AWARE wrapper (0221), not the bare
-    // get_dashboard_summary(): "This Month" must compare against the full
-    // previous calendar month, not the preceding equal-length window.
-    getDashboardSummaryWithComparison(dateFrom, dateTo, periodPreset, storeId ? [storeId] : undefined),
+    // Hotfix 8.1.3 §1 — the CALENDAR-AWARE wrapper (0221): "This Month" must
+    // compare against the full previous calendar month, not the preceding
+    // equal-length window.
+    // Phase 10 — now reached through get_dashboard_summary_with_expenses()
+    // (0236), which calls that same wrapper and only ADDS the expenses section
+    // and the explicit before/after-expenses triad. `net_operating_return`
+    // itself is carried through unchanged.
+    getDashboardSummaryWithExpenses(dateFrom, dateTo, periodPreset, storeId ? [storeId] : undefined),
     getDashboardTrends(dateFrom, dateTo, storeId ? [storeId] : undefined),
     getReportVisibleStores(),
   ]);
